@@ -1,0 +1,9 @@
+# 1 – build the React app (creates /build folder)
+npm run build         
+
+# 2 – upload the new /build folder to Firebase Hosting
+
+firebase deploy --only hosting
+
+npm run build 
+firebase deploy --only hosting

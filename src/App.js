@@ -1,25 +1,27 @@
-import logo from './logo.svg';
-import './App.css';
+import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+import { ThemeProvider } from "@mui/material/styles";
+import CssBaseline from "@mui/material/CssBaseline";
 
-function App() {
+import theme from "./theme";
+import NavigationTabs from "./components/NavigationTabs";
+
+export default function App() {
   return (
-    <div className="App">
-      <header className="App-header">
-        <img src={logo} className="App-logo" alt="logo" />
-        <p>
-          Edit <code>src/App.js</code> and save to reload.
-        </p>
-        <a
-          className="App-link"
-          href="https://reactjs.org"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          Learn React
-        </a>
-      </header>
-    </div>
+    <ThemeProvider theme={theme}>
+      <CssBaseline />
+
+      {/* React‑Router takes care of URL routing */}
+      <BrowserRouter>
+        <Routes>
+          {/* All pages are rendered by NavigationTabs.
+              It decides which inner view (runner / creator / …) to show
+              based on the URL pathname.                        */}
+          <Route path="/*" element={<NavigationTabs />} />
+
+          {/* Any unknown route → send user to the default page */}
+          <Route path="*" element={<Navigate to="/runner" replace />} />
+        </Routes>
+      </BrowserRouter>
+    </ThemeProvider>
   );
 }
-
-export default App;
