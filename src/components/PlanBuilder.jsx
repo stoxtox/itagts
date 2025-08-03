@@ -24,9 +24,9 @@ const noSpace = s => !/\s/.test(s);
 const sixDP   = v => Number(Number(v).toFixed(6));
 
 const anchorLabels = {
-  A1: "A1  (σ Lat)",
-  A2: "A2  (σ Lon)",
-  A3: "A3  (σ Ht)",
+  A1: "A1  (Lat)",
+  A2: "A2  (Lon)",
+  A3: "A3  (Ht)",
   B1: "B1  (Lever X)",
   B2: "B2  (Lever Y)",
   B3: "B3  (Lever Z)"
@@ -39,8 +39,8 @@ export default function PlanBuilder() {
 
   const [planName, setPlanName] = useState("");
   const [anchors,  setAnchors]  = useState({
-    A1: "0",   A2: "0",   A3: "0",
-    B1: "0.1", B2: "0.1", B3: "0.1"
+    A1: "0.1",   A2: "0.1",   A3: "0.1",
+    B1: "0", B2: "0", B3: "0"
   });
   const [zupts,    setZupts]    = useState([]);
 
@@ -103,7 +103,7 @@ export default function PlanBuilder() {
       await addDoc(collection(db, "plans"), docBody);
       alert("✅ Saved");
       setPlanName("");
-      setAnchors({ A1: "0", A2: "0", A3: "0", B1: "0.1", B2: "0.1", B3: "0.1" });
+      setAnchors({ A1: "0.1", A2: "0.1", A3: "0.1", B1: "0", B2: "0", B3: "0" });
       setZupts([]);
     } catch (e) { console.error(e); alert("Save failed"); }
   };

@@ -1,16 +1,27 @@
 // src/components/NavigationTabs.jsx
 import React, { useEffect, useState } from "react";
 import {
-  Box, Paper, Stack, Typography, Avatar, IconButton,
-  Button, Menu, MenuItem, Divider, ListItemIcon, Backdrop,
-  CircularProgress
+  Box,
+  Paper,
+  Stack,
+  Typography,
+  Avatar,
+  IconButton,
+  Menu,
+  MenuItem,
+  Divider,
+  ListItemIcon,
+  Backdrop,
+  CircularProgress,
+  Snackbar,
+  Alert
 } from "@mui/material";
-import MoreVertIcon          from "@mui/icons-material/MoreVert";
-import DirectionsRunIcon     from "@mui/icons-material/DirectionsRun";
-import BuildIcon             from "@mui/icons-material/Build";
-import DescriptionIcon       from "@mui/icons-material/Description";
-import HistoryIcon           from "@mui/icons-material/History";
-import LogoutIcon            from "@mui/icons-material/Logout";
+import MoreVertIcon      from "@mui/icons-material/MoreVert";
+import DirectionsRunIcon from "@mui/icons-material/DirectionsRun";
+import BuildIcon         from "@mui/icons-material/Build";
+import DescriptionIcon   from "@mui/icons-material/Description";
+import HistoryIcon       from "@mui/icons-material/History";
+import LogoutIcon        from "@mui/icons-material/Logout";
 
 import PlanRunner   from "./PlanRunner";
 import PlanBuilder  from "./PlanBuilder";
@@ -19,13 +30,20 @@ import SessionsPage from "./SessionsPage";
 import LoginPage    from "./LoginPage";
 
 import {
-  getAuth, GoogleAuthProvider, signInWithPopup,
-  signOut, onAuthStateChanged
+  GoogleAuthProvider,
+  signInWithPopup,
+  signOut,
+  onAuthStateChanged
 } from "firebase/auth";
+import { doc, getDoc, setDoc } from "firebase/firestore";
+import { auth, db } from "../firebase";
 
 import {
-  useNavigate, useLocation,
-  Routes, Route, Navigate
+  useNavigate,
+  useLocation,
+  Routes,
+  Route,
+  Navigate
 } from "react-router-dom";
 
 /* ---------- helpers ---------- */
@@ -38,55 +56,111 @@ const viewFromPath = (pathname = "/") => {
 const pathFromView = (view) => `/${view}`;
 
 const VIEWS = {
-  runner  : { label: "Run Timestamp",  icon: DirectionsRunIcon },
-  creator : { label: "Plan Creator",   icon: BuildIcon         },
-  plans   : { label: "Your Plans",     icon: DescriptionIcon   },
-  sessions: { label: "Saved Sessions", icon: HistoryIcon       }
+  runner:  { label: "Run Timestamp",  icon: DirectionsRunIcon },
+  creator: { label: "Plan Creator",   icon: BuildIcon         },
+  plans:   { label: "Your Plans",     icon: DescriptionIcon   },
+  sessions:{ label: "Saved Sessions", icon: HistoryIcon       }
 };
 
 export default function NavigationTabs() {
-  /* ---------- auth ---------- */
-  const auth      = getAuth();
-  const navigate  = useNavigate();
-  const location  = useLocation();
+  const navigate = useNavigate();
+  const location = useLocation();
 
-  const [user,        setUser]        = useState(null);
-  const [authLoaded,  setAuthLoaded]  = useState(false); // ✅ track first auth result
+  // auth + UI state
+  const [user,       setUser]       = useState(null);
+  const [authLoaded, setAuthLoaded] = useState(false);
+  const [loading,    setLoading]    = useState(false);
+  const [authError,  setAuthError]  = useState("");
 
-  // listen once; mark authLoaded after first callback fires
+  // monitor auth state
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, (u) => {
       setUser(u);
       setAuthLoaded(true);
     });
     return unsub;
-  }, [auth]);
+  }, []);
 
-  /* jump to /runner immediately after a fresh login */
-  useEffect(() => {
-    if (user && location.pathname === "/login") {
-      navigate("/runner", { replace: true });
-    }
-  }, [user, location.pathname, navigate]);
-
-  /* login / logout helpers */
+  // google provider
   const provider = new GoogleAuthProvider();
   provider.setCustomParameters({ prompt: "select_account" });
 
-  const login  = () => signInWithPopup(auth, provider);
+  // check if /users/{uid} exists
+  const userDocExists = async (uid) => {
+    const snap = await getDoc(doc(db, "users", uid));
+    return snap.exists();
+  };
+
+  // LOGIN
+  const login = async () => {
+    try {
+      setLoading(true);
+      const res = await signInWithPopup(auth, provider);
+      const exists = await userDocExists(res.user.uid);
+      if (!exists) {
+        await signOut(auth);
+        throw new Error("No account found. Please sign up first.");
+      }
+    } catch (err) {
+      // ignore benign popup cancellations
+      if (
+        err.code !== "auth/cancelled-popup-request" &&
+        err.code !== "auth/popup-closed-by-user"
+      ) {
+        console.error(err);
+        setAuthError(err.message || "Login failed.");
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // SIGN UP
+  const signup = async () => {
+    try {
+      setLoading(true);
+      const res  = await signInWithPopup(auth, provider);
+      const uid  = res.user.uid;
+      const ref  = doc(db, "users", uid);
+      const snap = await getDoc(ref);
+
+      if (snap.exists()) {
+        await signOut(auth);
+        throw new Error("Account exists. Please choose Login.");
+      }
+      await setDoc(ref, {
+        uid,
+        name:      res.user.displayName,
+        email:     res.user.email,
+        createdAt: new Date().toISOString()
+      });
+    } catch (err) {
+      if (
+        err.code !== "auth/cancelled-popup-request" &&
+        err.code !== "auth/popup-closed-by-user"
+      ) {
+        console.error(err);
+        setAuthError(err.message || "Sign-up failed.");
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // LOGOUT
   const logout = async () => {
     await signOut(auth);
     navigate("/login", { replace: true });
   };
 
-  /* ---------- active view ---------- */
+  // routing state
   const [activeView, setActiveView] = useState(() =>
     viewFromPath(location.pathname)
   );
   useEffect(() => {
     const next = viewFromPath(location.pathname);
     if (next !== activeView) setActiveView(next);
-  }, [location.pathname]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [location.pathname]);
 
   const jump = (view) => {
     setActiveView(view);
@@ -94,22 +168,20 @@ export default function NavigationTabs() {
     closeMenu();
   };
 
-  /* ---------- menu ---------- */
+  // menu
   const [menuAnchor, setMenuAnchor] = useState(null);
   const openMenu  = (e) => setMenuAnchor(e.currentTarget);
   const closeMenu = ()  => setMenuAnchor(null);
 
-  /* ---------- body component ---------- */
+  // choose body
   const body = {
-    runner   : <PlanRunner />,
-    creator  : <PlanBuilder />,
-    plans    : <PlansPage />,
-    sessions : <SessionsPage />
+    runner:   <PlanRunner />,
+    creator:  <PlanBuilder />,
+    plans:    <PlansPage />,
+    sessions: <SessionsPage />
   }[activeView];
 
-  /* ---------- render ---------- */
-
-  // 1️⃣  STILL LOADING AUTH? ➜ show a sleek backdrop loader
+  // RENDER
   if (!authLoaded) {
     return (
       <Backdrop open sx={{ color: "#fff", zIndex: (t) => t.zIndex.drawer + 1 }}>
@@ -118,17 +190,40 @@ export default function NavigationTabs() {
     );
   }
 
-  // 2️⃣  NO USER (after auth resolved) ➜ normal /login routing
   if (!user) {
     return (
-      <Routes>
-        <Route path="/login" element={<LoginPage onLogin={login} />} />
-        <Route path="*" element={<Navigate to="/login" replace />} />
-      </Routes>
+      <>
+        <Routes>
+          <Route
+            path="/login"
+            element={
+              <LoginPage
+                onLogin={login}
+                onSignup={signup}
+                loading={loading}
+              />
+            }
+          />
+          <Route path="*" element={<Navigate to="/login" replace />} />
+        </Routes>
+        <Snackbar
+          open={!!authError}
+          autoHideDuration={6000}
+          onClose={() => setAuthError("")}
+          anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+        >
+          <Alert
+            severity="error"
+            onClose={() => setAuthError("")}
+            sx={{ width: "100%" }}
+          >
+            {authError}
+          </Alert>
+        </Snackbar>
+      </>
     );
   }
 
-  // 3️⃣  AUTHENTICATED ➜ main UI
   const { label, icon: HeaderIcon } = VIEWS[activeView];
 
   return (
@@ -163,7 +258,7 @@ export default function NavigationTabs() {
           </Stack>
         </Stack>
 
-        {/* page body */}
+        {/* body */}
         <Box sx={{ mt: 2 }}>{body}</Box>
       </Paper>
     </Box>
