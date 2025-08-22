@@ -1,5 +1,7 @@
 // src/components/SessionsPage.jsx
 // Mobile-friendly with orphan-plan handling + detail popup, merge, delete & rename
+// Shows tiny icons for "started offline" (⚡) and "merged", plus an info (i) icon
+// for which plan was used (tooltip). Also de-dupes identical sessions on load.
 
 import React, { useEffect, useState, useCallback } from "react";
 import {
@@ -9,17 +11,18 @@ import {
   FormControl, InputLabel, Select, MenuItem, Slider, Button, Checkbox,
   ToggleButtonGroup, ToggleButton, TableContainer,
   Table, TableHead, TableRow, TableCell, TableBody, ListItemIcon,
-  useTheme, useMediaQuery, AppBar, Toolbar, Chip, TextField,
-  Skeleton, Backdrop
+  useTheme, useMediaQuery, AppBar, Toolbar, TextField, Backdrop
 } from "@mui/material";
-import VisibilityIcon    from "@mui/icons-material/Visibility";
-import DownloadIcon      from "@mui/icons-material/Download";
-import MergeIcon         from "@mui/icons-material/LibraryAdd";
-import DeleteForeverIcon from "@mui/icons-material/DeleteForever";
-import EditIcon          from "@mui/icons-material/Edit";
-import ContentCopyIcon   from "@mui/icons-material/ContentCopy";
-import EmailIcon         from "@mui/icons-material/Email";
-import CloseIcon         from "@mui/icons-material/Close";
+import VisibilityIcon        from "@mui/icons-material/Visibility";
+import DownloadIcon          from "@mui/icons-material/Download";
+import MergeIcon             from '@mui/icons-material/Merge';
+import DeleteForeverIcon     from "@mui/icons-material/DeleteForever";
+import EditIcon              from "@mui/icons-material/Edit";
+import ContentCopyIcon       from "@mui/icons-material/ContentCopy";
+import EmailIcon             from "@mui/icons-material/Email";
+import CloseIcon             from "@mui/icons-material/Close";
+import OfflineBoltIcon       from "@mui/icons-material/OfflineBolt";
+import InfoOutlinedIcon      from "@mui/icons-material/InfoOutlined";
 
 import { db } from "../firebase";
 import {
@@ -28,7 +31,16 @@ import {
 } from "firebase/firestore";
 import { getAuth } from "firebase/auth";
 
-/* ───────── helpers (unchanged) ───────── */
+/* ───────── safe date helpers ───────── */
+const toDateSafe = (v) => {
+  if (!v) return new Date(0);
+  if (typeof v?.toDate === "function") return v.toDate(); // Firestore Timestamp
+  if (v instanceof Date) return v;
+  return new Date(v); // ISO or millis
+};
+const toMillisSafe = (v) => toDateSafe(v).getTime();
+
+/* ───────── helpers ───────── */
 const UTC_TO_GPS_OFFSET = 18;
 const GPS_EPOCH = Date.UTC(1980, 0, 6);
 const SEC_WEEK  = 604_800;
@@ -42,19 +54,20 @@ const utcToGps = utc=>{
   const s = Math.floor((g-GPS_EPOCH)/1000);
   return { wn: Math.floor(s/SEC_WEEK), sow: s%SEC_WEEK };
 };
-const norm = s => s.replace(/^\s*\d+\s*[:.\-]\s*/,"").replace(/[\s._-]+/g,"").toLowerCase();
+const norm = s => (s ?? "").replace(/^\s*\d+\s*[:.\-]\s*/,"").replace(/[\s._-]+/g,"").toLowerCase();
 const shortDate = ts =>
-  ts.toDate().toLocaleString("en-US",{
+  toDateSafe(ts).toLocaleString("en-US",{
     year:"2-digit",month:"numeric",day:"numeric",
     hour:"numeric",minute:"2-digit",hour12:true
   }).replace(" AM","am").replace(" PM","pm");
 
 const buildSessionText = s=>{
   const title = `**${s.sessionTitle||s.planName} – ${shortDate(s.startedAt)}**`;
-  const ts=[...(s.timestamps||[])].sort((a,b)=>a.time.toMillis()-b.time.toMillis());
+  const ts=[...(s.timestamps||[])]
+    .sort((a,b)=>toMillisSafe(a.time)-toMillisSafe(b.time));
   const loops={}, manuals=[];
   ts.forEach(t=>{
-    const n=t.zuptName||""; const stamp=hhmmss(t.time.toDate());
+    const n=t.zuptName||""; const stamp=hhmmss(toDateSafe(t.time));
     const mS=n.match(/^L(\d+)\s*Start$/i); const mE=n.match(/^L(\d+)\s*Stop$/i);
     if(mS){ const i=mS[1]; loops[i]={...(loops[i]||{}),start:stamp};}
     else if(mE){ const i=mE[1]; loops[i]={...(loops[i]||{}),stop:stamp};}
@@ -77,7 +90,7 @@ export default function SessionsPage() {
   const [sessions,setSessions] = useState(null);
   const [plans,   setPlans]    = useState({});
   const [detail,  setDetail]   = useState(null);
-  const [loading, setLoading]  = useState(true);     // ⬅️ loader flag
+  const [loading, setLoading]  = useState(true);
 
   /* UI */
   const [basis,setBasis]     = useState("UTC");
@@ -90,17 +103,59 @@ export default function SessionsPage() {
   const [editId,setEditId]     = useState(null);
   const [editText,setEditText] = useState("");
 
-  /* ---------- fetch helper ---------- */
+  /* ---------- fetch helper with DUP PURGE ---------- */
   const fetchAll = useCallback(async ()=>{
     if(!user) return;
     setLoading(true);
+
+    // Fetch all sessions for user
     const ss=await getDocs(query(
       collection(db,"sessions"),
       where("uid","==",user.uid)
     ));
-    const sessionList=ss.docs.map(d=>({id:d.id,...d.data()}))
-      .sort((a,b)=>b.startedAt.toMillis()-a.startedAt.toMillis());  // newest start first
+    let sessionList=ss.docs.map(d=>({id:d.id,...d.data()}));
 
+    // Build duplicate buckets by (name, startedAt, endedAt)
+    const nameOf = s => (s.sessionTitle || s.planName || "").trim().toLowerCase();
+    const dupKey = (s) => `${nameOf(s)}||${toMillisSafe(s.startedAt)}||${toMillisSafe(s.endedAt||0)}`;
+
+    // Decide keeper: prefer non-local id, has endedAt, more stamps
+    const score = (s) => {
+      const nonLocal = typeof s.id === "string" && !s.id.startsWith("local:");
+      const hasEnd   = !!s.endedAt;
+      const nstamps  = (s.timestamps?.length)||0;
+      return (nonLocal?1:0)*1e9 + (hasEnd?1:0)*1e6 + nstamps;
+    };
+
+    const buckets = new Map();
+    for (const s of sessionList) {
+      const k = dupKey(s);
+      if (!buckets.has(k)) buckets.set(k, []);
+      buckets.get(k).push(s);
+    }
+
+    const toDelete = [];
+    const keptByKey = new Map();
+    for (const [k, arr] of buckets.entries()) {
+      if (arr.length === 1) { keptByKey.set(k, arr[0]); continue; }
+      arr.sort((a,b)=>score(b)-score(a));
+      const keeper = arr[0];
+      keptByKey.set(k, keeper);
+      for (let i=1;i<arr.length;i++){
+        const s = arr[i];
+        if (typeof s.id === "string" && !s.id.startsWith("local:")) {
+          toDelete.push(s.id);
+        }
+      }
+    }
+    if (toDelete.length){
+      await Promise.allSettled(toDelete.map(id => deleteDoc(doc(db,"sessions",id))));
+    }
+
+    sessionList = Array.from(keptByKey.values())
+      .sort((a,b)=>toMillisSafe(b.startedAt)-toMillisSafe(a.startedAt));
+
+    // Plan map (orphan detection)
     const planMap={};
     await Promise.all(
       [...new Set(sessionList.map(s=>s.planId))].map(async id=>{
@@ -110,6 +165,7 @@ export default function SessionsPage() {
         }catch{ planMap[id]=null;}
       })
     );
+
     setSessions(sessionList);
     setPlans(planMap);
     setSelected(new Set());
@@ -138,30 +194,45 @@ export default function SessionsPage() {
     }
     if(!window.confirm(`Merge ${selArr.length} sessions into one?`))return;
 
-    const mergedT=selArr.flatMap(s=>s.timestamps||[])
-      .sort((a,b)=>a.time.toMillis()-b.time.toMillis());
-    const earliest=selArr.reduce(
-      (min,s)=>s.startedAt.toMillis()<min.toMillis()?s.startedAt:min, selArr[0].startedAt);
-    const mergedEnd=selArr.some(s=>s.endedAt)?selArr.reduce(
-      (max,s)=>!max||s.endedAt?.toMillis()>max.toMillis()?s.endedAt:max,null)
-      :Timestamp.now();
+    const mergedT=selArr
+      .flatMap(s=>(s.timestamps||[]))
+      .map(t=>({...t, time: toDateSafe(t.time)}))
+      .sort((a,b)=>a.time.getTime()-b.time.getTime())
+      .map(t=>({...t, time: Timestamp.fromDate(t.time)}));
+
+    const earliestDate = selArr.reduce(
+      (min,s)=> Math.min(min, toMillisSafe(s.startedAt)),
+      toMillisSafe(selArr[0].startedAt)
+    );
+    const earliest = Timestamp.fromDate(new Date(earliestDate));
+
+    const mergedEndTs = selArr.some(s=>s.endedAt)
+      ? selArr.reduce((max,s)=>{
+          const m = s.endedAt ? toMillisSafe(s.endedAt) : null;
+          return m !== null ? Math.max(max, m) : max;
+        }, 0)
+      : Date.now();
+    const mergedEnd = Timestamp.fromDate(new Date(mergedEndTs));
+
     const title=selArr[0].sessionTitle||selArr[0].planName;
 
     await addDoc(collection(db,"sessions"),{
       uid:user.uid, planId,
       planName:selArr[0].planName,
-      sessionTitle:`${title} (merged)`,
-      isMerged:true,            // 👈 flag for badge
+      sessionTitle:`${title}`,
+      isMerged:true,
       timezone:selArr[0].timezone,
-      startedAt:earliest, endedAt:mergedEnd,
-      timestamps:mergedT, createdAt:Timestamp.now()
+      startedAt:earliest,
+      endedAt:mergedEnd,
+      timestamps:mergedT,
+      createdAt:Timestamp.now()
     });
     await Promise.all(selArr.map(s=>deleteDoc(doc(db,"sessions",s.id))));
     setSnack("Sessions merged ✅");
     fetchAll();
   };
 
-  /* ---------- rows & export (unchanged) ---------- */
+  /* ---------- rows & export ---------- */
   const buildRows=s=>{
     const plan=plans[s.planId]??{anchors:{}};
     const anc=["A1","A2","A3","B1","B2","B3"].map(k=>plan.anchors?.[k]??"");
@@ -172,7 +243,7 @@ export default function SessionsPage() {
       if(view==="ZUPT"&&!zi)return [];
 
       const off=step===0?0:Math.min(step,t.duration??0);
-      const utc=addSec(t.time.toDate(),off);
+      const utc=addSec(toDateSafe(t.time),off);
       const cell=basis==="UTC"?hhmmss(utc):utcToGps(utc).sow;
 
       const base=zi?zi.name:t.zuptName;
@@ -185,7 +256,7 @@ export default function SessionsPage() {
 
   const exportTxt=s=>{
     const rows=buildRows(s);
-    const {wn}=utcToGps(s.startedAt.toDate());
+    const {wn}=utcToGps(toDateSafe(s.startedAt));
     const header=`${view==="ZUPT"?"ZUPT":"STAMP"}\t`+
                  `${basis==="UTC"?"UTC_hhmmss":`GPS_SOW (WN ${wn})`}`+
                  "\tlat\tlon\theight\tA1\tA2\tA3\tB1\tB2\tB3";
@@ -249,36 +320,49 @@ export default function SessionsPage() {
               <ListItem
                 secondaryAction={
                   <Stack direction="row" spacing={0}>
-                  <Tooltip title="Rename">
-                    <IconButton
-                      size={isMobile ? "small" : "medium"}
-                      onClick={() => {
-                        setEditId(s.id);
-                        setEditText(s.sessionTitle || "");
-                      }}
+                    {/* inline "plan info" icon */}
+                    <Tooltip
+                      title={
+                        plans[s.planId] === null
+                          ? "Plan deleted"
+                          : `Plan: ${plans[s.planId]?.name || s.planName || "(unknown)"}`
+                      }
                     >
-                      <EditIcon sx={isMobile ? { fontSize: 18 } : undefined} />
-                    </IconButton>
-                  </Tooltip>
-                
-                  <Tooltip title="View details">
-                    <IconButton
-                      size={isMobile ? "small" : "medium"}
-                      onClick={() => setDetail(s)}
-                    >
-                      <VisibilityIcon sx={isMobile ? { fontSize: 18 } : undefined} />
-                    </IconButton>
-                  </Tooltip>
-                
-                  <Tooltip title="Export TXT">
-                    <IconButton
-                      size={isMobile ? "small" : "medium"}
-                      onClick={() => exportTxt(s)}
-                    >
-                      <DownloadIcon sx={isMobile ? { fontSize: 18 } : undefined} />
-                    </IconButton>
-                  </Tooltip>
-                </Stack>                
+                      <IconButton size={isMobile ? "small" : "medium"}>
+                        <InfoOutlinedIcon sx={isMobile ? { fontSize: 18 } : undefined} />
+                      </IconButton>
+                    </Tooltip>
+
+                    <Tooltip title="Rename">
+                      <IconButton
+                        size={isMobile ? "small" : "medium"}
+                        onClick={() => {
+                          setEditId(s.id);
+                          setEditText(s.sessionTitle || "");
+                        }}
+                      >
+                        <EditIcon sx={isMobile ? { fontSize: 18 } : undefined} />
+                      </IconButton>
+                    </Tooltip>
+
+                    <Tooltip title="View details">
+                      <IconButton
+                        size={isMobile ? "small" : "medium"}
+                        onClick={() => setDetail(s)}
+                      >
+                        <VisibilityIcon sx={isMobile ? { fontSize: 18 } : undefined} />
+                      </IconButton>
+                    </Tooltip>
+
+                    <Tooltip title="Export TXT">
+                      <IconButton
+                        size={isMobile ? "small" : "medium"}
+                        onClick={() => exportTxt(s)}
+                      >
+                        <DownloadIcon sx={isMobile ? { fontSize: 18 } : undefined} />
+                      </IconButton>
+                    </Tooltip>
+                  </Stack>
                 }
               >
                 <ListItemIcon sx={{minWidth:32,pr:0}}>
@@ -291,32 +375,34 @@ export default function SessionsPage() {
 
                 <ListItemText
                   primary={
-                    <>
-                      {s.sessionTitle||s.planName}
-                      {s.isMerged && (
-                        <Typography
-                        sx={{
-                          ml: 1,
-                          color: "primary.main",
-                          fontWeight: 600,
-                          fontSize: isMobile ? 10 : 12,  // very small on mobile
-                          lineHeight: 1
-                        }}
-                        component="span"
-                      >
-                        (merged)
+                    <Stack direction="row" spacing={0.75} alignItems="center" flexWrap="wrap">
+                      <Typography component="span" sx={{fontSize:15,fontWeight:600}}>
+                        {s.sessionTitle||s.planName}
                       </Typography>
+
+                      {/* tiny icons (no text) */}
+                      {(s.startedOffline || (typeof s.id === "string" && s.id.startsWith("local:"))) && (
+                        <Tooltip title="Started offline">
+                          <OfflineBoltIcon sx={{ fontSize: 16, color: "warning.main" }} />
+                        </Tooltip>
                       )}
+                      {s.isMerged && (
+                        <Tooltip title="Merged session">
+                          <MergeIcon sx={{ fontSize: 16, color: "primary.main" }} />
+                        </Tooltip>
+                      )}
+
+                      {/* orphan plan indicator */}
                       {plans[s.planId]===null&&(
-                        <Typography component="span" color="error" ml={1}
-                        sx={{fontWeight: 600,fontSize: isMobile ? 10 : 12}}>
-                          (plan deleted)
-                        </Typography>
+                        <Tooltip title="Plan deleted">
+                          <Typography component="span" color="error" sx={{fontWeight:600,fontSize:11}}>
+                            (plan deleted)
+                          </Typography>
+                        </Tooltip>
                       )}
-                    </>
+                    </Stack>
                   }
                   secondary={`${shortDate(s.startedAt)} • ZUPTs: ${s.timestamps?.length||0}`}
-                  primaryTypographyProps={{fontSize:15,fontWeight:600}}
                   secondaryTypographyProps={{fontSize:10}}
                 />
               </ListItem>
@@ -332,12 +418,10 @@ export default function SessionsPage() {
           position:"fixed",bottom:20,left:"50%",transform:"translateX(-50%)",
           width:{xs:"calc(90% - 32px)",sm:"480px",md:"560px"},
           px:1,py:1,borderRadius:4,zIndex:10,display:"flex",
-                                /* glass effect */
-                                backgroundColor: "rgba(255,255,255,0.15)",   // translucent “pane”
-                                border: "1px solid rgba(255,255,255,0.25)",  // light frosted edge
-                                backdropFilter: "blur(5px)",                // stronger blur for depth
-                                WebkitBackdropFilter: "blur(5px)",
-
+          backgroundColor: "rgba(255,255,255,0.15)",
+          border: "1px solid rgba(255,255,255,0.25)",
+          backdropFilter: "blur(5px)",
+          WebkitBackdropFilter: "blur(5px)",
           alignItems:"center", justifyContent: "center",gap:1,flexWrap:{xs:"wrap",sm:"nowrap"}
         }}>
 
@@ -371,8 +455,9 @@ export default function SessionsPage() {
       <Dialog open={!!detail} onClose={()=>setDetail(null)}
               maxWidth="md" fullWidth fullScreen={isMobile} scroll="body">
         {detail&&(()=>{            // IIFE
-          const wn=utcToGps(detail.startedAt.toDate()).wn;
+          const wn=utcToGps(toDateSafe(detail.startedAt)).wn;
           const rows=buildRows(detail);
+          const startedOffline = detail.startedOffline || (typeof detail.id === "string" && detail.id.startsWith("local:"));
           return(
             <>
               {/* title bar */}
@@ -398,19 +483,38 @@ export default function SessionsPage() {
               )}
 
               <DialogContent dividers>
-                <Typography variant="body2">
-                  Started: {detail.startedAt.toDate().toLocaleString()}
-                </Typography>
+                <Stack direction="row" spacing={1} alignItems="center">
+                  <Typography variant="body2">
+                    Started: {toDateSafe(detail.startedAt).toLocaleString()}
+                  </Typography>
+                  {startedOffline && (
+                    <Tooltip title="Started offline">
+                      <OfflineBoltIcon sx={{ fontSize: 16, color: "warning.main" }} />
+                    </Tooltip>
+                  )}
+                  <Tooltip
+                    title={
+                      plans[detail.planId] === null
+                        ? "Plan deleted"
+                        : `Plan: ${plans[detail.planId]?.name || detail.planName || "(unknown)"}`
+                    }
+                  >
+                    <InfoOutlinedIcon sx={{ fontSize: 16, color: "text.secondary" }} />
+                  </Tooltip>
+                </Stack>
+
                 <Typography variant="body2" gutterBottom>
                   Ended: {detail.endedAt
-                    ? detail.endedAt.toDate().toLocaleString()
+                    ? toDateSafe(detail.endedAt).toLocaleString()
                     : "—"}
                 </Typography>
+
                 {plans[detail.planId]===null&&(
                   <Typography variant="caption" color="error">
                     Original plan deleted — coordinates unavailable.
                   </Typography>
                 )}
+
                 <Divider sx={{my:2}}/>
 
                 {/* control bar */}
