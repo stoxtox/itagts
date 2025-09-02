@@ -6,9 +6,8 @@
 // - Local outbox + local session index & stamps; auto-flush on reconnect (idempotent)
 // - Auto-resume only when OFFLINE (online never auto-opens)
 // - Compact header status row (only offline): cloud/pending/finished
-// - Refreshes after Start (offline) and Finish to make state obvious
-// - planSnapshot ensures ZUPTs are available offline
 // - No geolocation
+// - Smooth UX: no hard reloads; instant badge/counter updates
 
 import React, { useEffect, useState, useMemo } from "react";
 import {
@@ -31,7 +30,6 @@ import CloudOffIcon from "@mui/icons-material/CloudOff";
 import CloudUploadIcon from "@mui/icons-material/CloudUpload";
 import AssignmentTurnedInIcon from "@mui/icons-material/AssignmentTurnedIn";
 import OfflineBoltIcon from "@mui/icons-material/OfflineBolt";
-import InfoIcon from "@mui/icons-material/Info";
 
 import LoaderOverlay from "./LoaderOverlay";
 
@@ -297,8 +295,13 @@ export default function PlanRunner() {
   const [{ loopIdx, loopOn }, setLoopMeta] = useState({ loopIdx: 1, loopOn: false });
   const [captured, setCaptured] = useState(new Set());
 
-  /* panel state placed before early returns */
+  /* compact status dialogs */
   const [openPanel, setOpenPanel] = useState(null); // 'net'|'queued'|'finished'|null
+
+  /* 🔔 instant-update helpers (no page reloads) */
+  const [poke, setPoke] = useState(0);          // force re-render after outbox/index changes
+  const bump = () => setPoke(x => x + 1);
+  const [formKey, setFormKey] = useState(0);    // reset pre-start form after Finish
 
   useEffect(() => {
     if (!startedAt) return;
@@ -353,12 +356,10 @@ export default function PlanRunner() {
     persistStampsLocal(sessionId, list);
 
     if (!online) {
-      // queue UPDATE with plain millis for time (stable to rehydrate)
-      const payload = {
-        timestamps: list.map(t => ({ ...t, time: toMillis(t.time) }))
-      };
+      const payload = { timestamps: list.map(t => ({ ...t, time: toMillis(t.time) })) };
       pushReplace(sessionId, "update", payload);
       localQueueTouch();
+      bump();                   // 👈 refresh queued/badges instantly
       setSnack(msg);
       return;
     }
@@ -370,6 +371,7 @@ export default function PlanRunner() {
     } catch {
       const payload = { timestamps: list.map(t => ({ ...t, time: toMillis(t.time) })) };
       pushReplace(sessionId, "update", payload);
+      bump();                   // 👈
     }
     setSnack(msg);
   };
@@ -459,6 +461,7 @@ export default function PlanRunner() {
       if (touched) saveIndex(idx0);
 
       if (ops.length !== filtered.length) setSnack("Offline changes synced");
+      bump();   // 👈 reflect counts immediately
     };
 
     flush();
@@ -504,7 +507,7 @@ export default function PlanRunner() {
         planSnapshot: snapshot,
         sessionTitle: title.trim(),
         timezone: tz,
-        startedAt: ts.getTime(),        // millis for JSON durability
+        startedAt: ts.getTime(),
         timestamps: [],
         endedAt: null,
         startedOffline: true,
@@ -512,6 +515,7 @@ export default function PlanRunner() {
       };
       pushCreateOnce(newId, payload);
       localQueueTouch();
+      bump();                      // 👈 queued badge now
     } else {
       try {
         const ref = await addDoc(collection(db, "sessions"), {
@@ -545,6 +549,7 @@ export default function PlanRunner() {
           createdAt: Date.now()
         };
         pushCreateOnce(newId, payload);
+        bump();                    // 👈
       }
     }
 
@@ -561,7 +566,9 @@ export default function PlanRunner() {
     };
     saveIndex(idx);
     saveStamps(newId, []);
+    bump();                        // 👈 reflect “resume” list right away
 
+    // live UI
     setSessionId(newId);
     setStartedAt(ts);
     setLoopMeta({ loopIdx: 1, loopOn: false });
@@ -572,7 +579,9 @@ export default function PlanRunner() {
     setSnack(offlineStart ? "Session started (offline)" : "Session started");
 
     try { sessionStorage.setItem("activeSessionId", newId); } catch {}
-    if (offlineStart) setTimeout(() => window.location.reload(), 300);
+
+    // No reload: if offline, reveal the queued panel so it’s obvious
+    if (offlineStart) setOpenPanel("queued");
   };
 
   const resume = (s) => {
@@ -644,12 +653,14 @@ export default function PlanRunner() {
     if (!online) {
       pushReplace(sessionId, "finish", payloadOffline);
       localQueueTouch();
+      bump();                    // 👈
     } else {
       try {
         await updateDoc(doc(db, "sessions", sessionId), { endedAt: Timestamp.fromDate(new Date()) });
       } catch {
         queued = true;
         pushReplace(sessionId, "finish", payloadOffline);
+        bump();                  // 👈
       }
     }
 
@@ -660,10 +671,29 @@ export default function PlanRunner() {
     } else {
       if (idx[sessionId]) { delete idx[sessionId]; saveIndex(idx); }
     }
+    bump();                      // 👈 update pending badge immediately
 
     try { sessionStorage.removeItem("activeSessionId"); } catch {}
+
+    // Clear live UI (what old reload did)
+    setSessionId(null);
+    setStartedAt(null);
+    setLoopMeta({ loopIdx: 1, loopOn: false });
+    setCaptured(new Set());
+    setActive(null); setRemain(null);
+    setStamps([]);
+    setSessionPlan(null);
+    setStartedOffline(false);
+
+    // Reset pre-start form (and kill autofill ghosts)
+    setTitle("");
+    setPlanId("");
+    setFormKey(k => k + 1);
+
     setSnack(queued ? "Session finalized (will upload when online)" : "Session finalized");
-    setTimeout(() => window.location.reload(), 400);
+
+    // No reload: show finished panel when offline
+    if (queued) setOpenPanel("finished");
   };
 
   /* Auto-resume session from hint — OFFLINE ONLY */
@@ -679,279 +709,262 @@ export default function PlanRunner() {
     } catch {}
   }, [user, startedAt, online]);
 
-  /* === UI === */
-  if (user === undefined) return <LoaderOverlay open />; // loading auth
-  if (user === null) return (
-    <Box sx={{ maxWidth: 720, mx: "auto", p: 3 }}>
-      <Alert severity="info">Please sign in to run a session.</Alert>
-    </Box>
-  );
-
+  /* derived UI lists/counters (recompute on every render; backed by localStorage) */
   const outbox = !online ? loadOutbox() : [];
   const queuedCount = outbox.filter(o => o.type !== "touch").length;
+  const userUid = user?.uid;
   const pendingFinished = !online
-    ? Object.values(loadIndex()).filter(x => x.status === "finished-pending" && x.uid === user.uid)
+    ? Object.values(loadIndex()).filter(x => x.status === "finished-pending" && x.uid === userUid)
     : [];
   const finishedCount = pendingFinished.length;
 
-  const localActives = Object.values(loadIndex())
-    .filter(x => x.status === "active" && x.uid === user.uid)
+  const localActives = Object
+    .values(loadIndex())
+    .filter(x => x.status === "active" && x.uid === userUid)
     .map(x => ({ ...x, local: true }));
 
   const unfinished = [
-    ...unfinishedFirebase,
-    ...localActives.filter(l => !unfinishedFirebase.some(f => f.id === l.id))
+    ...(unfinishedFirebase || []),
+    ...localActives.filter(l => !(unfinishedFirebase || []).some(f => f.id === l.id))
   ];
-
   return (
-  <Box sx={{ maxWidth: isMobile ? "100%" : 900, mx: "auto", px: isMobile ? 1 : 2, pt: 2, pb: 8 }}>
-    {/* ───────────────── Header / Clock / Status ───────────────── */}
-    <Paper
-      elevation={6}
-      sx={{
-        p: isMobile ? 2 : 3,
-        mb: isMobile ? 3 : 4,
-        borderRadius: 3,
-        color: "#fff",
-        textAlign: "center",
-        bgcolor: "transparent",
-        background:
-          "radial-gradient(110% 140% at 0% 0%, rgba(99,102,241,1) 0%, rgba(79,70,229,1) 55%, rgba(67,56,202,1) 100%)",
-        boxShadow:
-          "0 10px 30px rgba(79,70,229,.35), inset 0 0 0 1px rgba(255,255,255,0.06)",
-      }}
-    >
-      <Typography
-        variant={isMobile ? "h5" : "h4"}
-        fontWeight={800}
-        letterSpacing={0.2}
-        sx={{ textShadow: "0 1px 10px rgba(0,0,0,.18)" }}
+    <Box sx={{ maxWidth: isMobile ? "100%" : 900, mx: "auto", px: isMobile ? 1 : 2, pt: 2, pb: 8 }}>
+      {/* ───────────────── Header / Clock / Status ───────────────── */}
+      <Paper
+        elevation={6}
+        sx={{
+          p: isMobile ? 2 : 3,
+          mb: isMobile ? 3 : 4,
+          borderRadius: 3,
+          color: "#fff",
+          textAlign: "center",
+          bgcolor: "transparent",
+          background:
+            "radial-gradient(110% 140% at 0% 0%, rgba(99,102,241,1) 0%, rgba(79,70,229,1) 55%, rgba(67,56,202,1) 100%)",
+          boxShadow:
+            "0 10px 30px rgba(79,70,229,.35), inset 0 0 0 1px rgba(255,255,255,0.06)",
+        }}
       >
-        {clock}
-      </Typography>
-
-      {startedAt && startedOffline && (
-        <Tooltip title="This session was started while offline">
-          <Chip
-            size="small"
-            color="warning"
-            variant="filled"
-            icon={<OfflineBoltIcon />}
-            label="Started offline"
-            sx={{
-              mt: 1,
-              color: "#111",
-              fontWeight: 600,
-              bgcolor: "rgba(255,214,102,.95)",
-              "& .MuiChip-icon": { color: "#111" },
-            }}
-          />
-        </Tooltip>
-      )}
-
-      <Box sx={{ display: "flex", justifyContent: "center" }}>
-        <TextField
-          select
-          size="small"
-          value={tz}
-          onChange={(e) => setTz(e.target.value)}
-          sx={{
-            mt: 1.25,
-            width: 140,
-            ".MuiOutlinedInput-root": {
-              bgcolor: "rgba(255,255,255,0.12)",
-              color: "#fff",
-              borderRadius: 2,
-              "& fieldset": { borderColor: "rgba(255,255,255,0.18)" },
-              "&:hover fieldset": { borderColor: "rgba(255,255,255,0.35)" },
-            },
-            ".MuiSvgIcon-root": { color: "#fff" },
-          }}
+        <Typography
+          variant={isMobile ? "h5" : "h4"}
+          fontWeight={800}
+          letterSpacing={0.2}
+          sx={{ textShadow: "0 1px 10px rgba(0,0,0,.18)" }}
         >
-          {TZ_LIST.map((t) => (
-            <MenuItem key={t} value={t}>
-              {t}
-            </MenuItem>
-          ))}
-        </TextField>
-      </Box>
-
-      {/* compact status row — render ONLY when offline */}
-      {!online && (
-        <Stack
-          direction="row"
-          spacing={1.5}
-          justifyContent="center"
-          alignItems="center"
-          sx={{ mt: 1.25 }}
-        >
-          <Tooltip title="Offline — network unavailable">
-            <span>
-              <IconButton
-                size="small"
-                onClick={() => setOpenPanel("net")}
-                aria-label="Network status"
-                sx={{
-                  color: "warning.light",
-                  bgcolor: "rgba(0,0,0,.18)",
-                  "&:hover": { bgcolor: "rgba(0,0,0,.26)" },
-                }}
-              >
-                <CloudOffIcon fontSize="small" />
-              </IconButton>
-            </span>
-          </Tooltip>
-
-          <Tooltip
-            title={
-              queuedCount
-                ? `${queuedCount} change${queuedCount > 1 ? "s" : ""} queued`
-                : "No queued changes"
-            }
-          >
-            <span>
-              <Badge
-                badgeContent={queuedCount || 0}
-                color={queuedCount ? "info" : "default"}
-                overlap="circular"
-              >
-                <IconButton
-                  size="small"
-                  onClick={() => setOpenPanel("queued")}
-                  aria-label="Queued changes"
-                  sx={{
-                    color: queuedCount ? "info.light" : "rgba(255,255,255,.7)",
-                    bgcolor: "rgba(0,0,0,.18)",
-                    "&:hover": { bgcolor: "rgba(0,0,0,.26)" },
-                  }}
-                >
-                  <CloudUploadIcon fontSize="small" />
-                </IconButton>
-              </Badge>
-            </span>
-          </Tooltip>
-
-          <Tooltip
-            title={
-              finishedCount
-                ? `${finishedCount} finished session${
-                    finishedCount > 1 ? "s" : ""
-                  } pending`
-                : "Nothing pending"
-            }
-          >
-            <span>
-              <Badge
-                badgeContent={finishedCount || 0}
-                color={finishedCount ? "warning" : "default"}
-                overlap="circular"
-              >
-                <IconButton
-                  size="small"
-                  onClick={() => setOpenPanel("finished")}
-                  aria-label="Finished pending"
-                  sx={{
-                    color: finishedCount ? "warning.light" : "rgba(255,255,255,.7)",
-                    bgcolor: "rgba(0,0,0,.18)",
-                    "&:hover": { bgcolor: "rgba(0,0,0,.26)" },
-                  }}
-                >
-                  <AssignmentTurnedInIcon fontSize="small" />
-                </IconButton>
-              </Badge>
-            </span>
-          </Tooltip>
-        </Stack>
-      )}
-    </Paper>
-
-    <Typography variant="h6" gutterBottom sx={{ fontWeight: 700, letterSpacing: 0.2 }}>
-      Run a Plan Session
-    </Typography>
-
-    {/* ───────────────── Resume (when nothing started) ───────────────── */}
-    {!startedAt && unfinished.length > 0 && (
-      <Box mb={3}>
-        <Typography variant="subtitle2" sx={{ fontWeight: 600, mb: 1 }}>
-          Resume unfinished:
+          {clock}
         </Typography>
-        {unfinished.map((s) => (
-          <Button
-            key={s.id}
-            variant="outlined"
-            size={isMobile ? "small" : "medium"}
-            sx={{ mr: 1, mb: 1 }}
-            onClick={() => resume(s)}
-          >
-            ▶ {s.sessionTitle || s.title || s.planName}
-            {s.local ? " (local)" : s.startedOffline ? " (offline)" : ""}
-          </Button>
-        ))}
-        <Divider sx={{ my: 2 }} />
-      </Box>
-    )}
 
-    {/* ───────────────── First-time form ───────────────── */}
-    {!startedAt && (
-      <>
-        <TextField
-          select
-          fullWidth
-          label="Select Plan"
-          sx={{ mb: 2 }}
-          value={planId}
-          onChange={(e) => setPlanId(e.target.value)}
-        >
-          {plans.map((p) => (
-            <MenuItem key={p.id} value={p.id}>
-              {p.name}
-            </MenuItem>
-          ))}
-        </TextField>
-        <TextField
-          fullWidth
-          label="Session Title"
-          sx={{ mb: 2 }}
-          value={title}
-          onChange={(e) => setTitle(e.target.value)}
-        />
-        <Button
-          fullWidth
-          variant="contained"
-          size={isMobile ? "large" : "medium"}
-          startIcon={<PlayArrowIcon />}
-          disabled={!planId || !title.trim()}
-          onClick={start}
-        >
-          Start Session
-        </Button>
-      </>
-    )}
-
-    {/* ───────────────── Live mode ───────────────── */}
-    {startedAt && activePlan && (
-      <>
-        {/* Session meta (title / plan / started) */}
-        <Stack
-          direction="row"
-          alignItems="center"
-          spacing={1}
-          sx={{ mt: 0.5, mb: 1, flexWrap: "wrap" }}
-        >
-          <Chip
-            size="small"
-            label={title || "(untitled)"}
-            sx={{
-              bgcolor: "rgba(99,102,241,0.10)",
-              border: "1px solid rgba(99,102,241,0.35)",
-              color: "text.primary",
-              fontWeight: 500,
-            }}
-          />
-          {activePlan?.name && (
+        {startedAt && startedOffline && (
+          <Tooltip title="This session was started while offline">
             <Chip
               size="small"
-              label={activePlan.name}
+              color="warning"
+              variant="filled"
+              icon={<OfflineBoltIcon />}
+              label="Started offline"
+              sx={{
+                mt: 1,
+                color: "#111",
+                fontWeight: 600,
+                bgcolor: "rgba(255,214,102,.95)",
+                "& .MuiChip-icon": { color: "#111" },
+              }}
+            />
+          </Tooltip>
+        )}
+
+        <Box sx={{ display: "flex", justifyContent: "center" }}>
+          <TextField
+            select
+            size="small"
+            value={tz}
+            onChange={(e) => setTz(e.target.value)}
+            sx={{
+              mt: 1.25,
+              width: 140,
+              ".MuiOutlinedInput-root": {
+                bgcolor: "rgba(255,255,255,0.12)",
+                color: "#fff",
+                borderRadius: 2,
+                "& fieldset": { borderColor: "rgba(255,255,255,0.18)" },
+                "&:hover fieldset": { borderColor: "rgba(255,255,255,0.35)" },
+              },
+              ".MuiSvgIcon-root": { color: "#fff" },
+            }}
+          >
+            {TZ_LIST.map((t) => (
+              <MenuItem key={t} value={t}>
+                {t}
+              </MenuItem>
+            ))}
+          </TextField>
+        </Box>
+
+        {/* compact status row — render ONLY when offline */}
+        {!online && (
+          <Stack
+            direction="row"
+            spacing={1.5}
+            justifyContent="center"
+            alignItems="center"
+            sx={{ mt: 1.25 }}
+          >
+            <Tooltip title="Offline — network unavailable">
+              <span>
+                <IconButton
+                  size="small"
+                  onClick={() => setOpenPanel("net")}
+                  aria-label="Network status"
+                  sx={{
+                    color: "warning.light",
+                    bgcolor: "rgba(0,0,0,.18)",
+                    "&:hover": { bgcolor: "rgba(0,0,0,.26)" },
+                  }}
+                >
+                  <CloudOffIcon fontSize="small" />
+                </IconButton>
+              </span>
+            </Tooltip>
+
+            <Tooltip
+              title={
+                queuedCount
+                  ? `${queuedCount} change${queuedCount > 1 ? "s" : ""} queued`
+                  : "No queued changes"
+              }
+            >
+              <span>
+                <Badge
+                  badgeContent={queuedCount || 0}
+                  color={queuedCount ? "info" : "default"}
+                  overlap="circular"
+                >
+                  <IconButton
+                    size="small"
+                    onClick={() => setOpenPanel("queued")}
+                    aria-label="Queued changes"
+                    sx={{
+                      color: queuedCount ? "info.light" : "rgba(255,255,255,.7)",
+                      bgcolor: "rgba(0,0,0,.18)",
+                      "&:hover": { bgcolor: "rgba(0,0,0,.26)" },
+                    }}
+                  >
+                    <CloudUploadIcon fontSize="small" />
+                  </IconButton>
+                </Badge>
+              </span>
+            </Tooltip>
+
+            <Tooltip
+              title={
+                finishedCount
+                  ? `${finishedCount} finished session${
+                      finishedCount > 1 ? "s" : ""
+                    } pending`
+                  : "Nothing pending"
+              }
+            >
+              <span>
+                <Badge
+                  badgeContent={finishedCount || 0}
+                  color={finishedCount ? "warning" : "default"}
+                  overlap="circular"
+                >
+                  <IconButton
+                    size="small"
+                    onClick={() => setOpenPanel("finished")}
+                    aria-label="Finished pending"
+                    sx={{
+                      color: finishedCount ? "warning.light" : "rgba(255,255,255,.7)",
+                      bgcolor: "rgba(0,0,0,.18)",
+                      "&:hover": { bgcolor: "rgba(0,0,0,.26)" },
+                    }}
+                  >
+                    <AssignmentTurnedInIcon fontSize="small" />
+                  </IconButton>
+                </Badge>
+              </span>
+            </Tooltip>
+          </Stack>
+        )}
+      </Paper>
+
+      <Typography variant="h6" gutterBottom sx={{ fontWeight: 700, letterSpacing: 0.2 }}>
+        Run a Plan Session
+      </Typography>
+
+      {/* ───────────────── Resume (when nothing started) ───────────────── */}
+      {!startedAt && unfinished.length > 0 && (
+        <Box mb={3}>
+          <Typography variant="subtitle2" sx={{ fontWeight: 600, mb: 1 }}>
+            Resume unfinished:
+          </Typography>
+          {unfinished.map((s) => (
+            <Button
+              key={s.id}
+              variant="outlined"
+              size={isMobile ? "small" : "medium"}
+              sx={{ mr: 1, mb: 1 }}
+              onClick={() => resume(s)}
+            >
+              ▶ {s.sessionTitle || s.title || s.planName}
+              {s.local ? " (local)" : s.startedOffline ? " (offline)" : ""}
+            </Button>
+          ))}
+          <Divider sx={{ my: 2 }} />
+        </Box>
+      )}
+
+      {/* ───────────────── First-time form ───────────────── */}
+      {!startedAt && (
+        <Box key={formKey}>
+          <TextField
+            select
+            fullWidth
+            label="Select Plan"
+            sx={{ mb: 2 }}
+            value={planId}
+            onChange={(e) => setPlanId(e.target.value)}
+          >
+            {plans.map((p) => (
+              <MenuItem key={p.id} value={p.id}>
+                {p.name}
+              </MenuItem>
+            ))}
+          </TextField>
+          <TextField
+            fullWidth
+            label="Session Title"
+            sx={{ mb: 2 }}
+            value={title}
+            onChange={(e) => setTitle(e.target.value)}
+          />
+          <Button
+            fullWidth
+            variant="contained"
+            size={isMobile ? "large" : "medium"}
+            startIcon={<PlayArrowIcon />}
+            disabled={!planId || !title.trim()}
+            onClick={start}
+          >
+            Start Session
+          </Button>
+        </Box>
+      )}
+
+      {/* ───────────────── Live mode ───────────────── */}
+      {startedAt && activePlan && (
+        <>
+          {/* Session meta (title / plan / started) */}
+          <Stack
+            direction="row"
+            alignItems="center"
+            spacing={1}
+            sx={{ mt: 0.5, mb: 1, flexWrap: "wrap" }}
+          >
+            <Chip
+              size="small"
+              label={title || "(untitled)"}
               sx={{
                 bgcolor: "rgba(99,102,241,0.10)",
                 border: "1px solid rgba(99,102,241,0.35)",
@@ -959,271 +972,282 @@ export default function PlanRunner() {
                 fontWeight: 500,
               }}
             />
-          )}
-          <Chip
-            size="small"
-            label={`${toDateSafe(startedAt).toLocaleDateString(undefined, {
-              month: "short",
-              day: "numeric",
-              hour: "2-digit",
-              minute: "2-digit",
-            })}`}
-            sx={{
-              bgcolor: "rgba(99,102,241,0.10)",
-              border: "1px solid rgba(99,102,241,0.35)",
-              color: "text.primary",
-              fontWeight: 500,
-            }}
-          />
-        </Stack>
-
-        {/* Elapsed / Lap strip */}
-        <Stack
-          direction="row"
-          alignItems="center"
-          justifyContent="space-between"
-          sx={{ mb: isMobile ? 1 : 2 }}
-        >
-          <Stack direction="row" alignItems="center" spacing={1}>
-            <TimerIcon fontSize="small" sx={{ color: "primary.main" }} />
-            <Typography variant="subtitle1" sx={{ fontWeight: 600 }}>
-              Elapsed: <strong>{lap}</strong>
-            </Typography>
-          </Stack>
-
-          <Stack direction="row" alignItems="center" spacing={1}>
-            <LocationIcon
-              fontSize="small"
-              sx={{ color: loopOn ? "error.main" : "text.secondary" }}
-            />
-            <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>
-              Current Lap: <strong>L{loopOn ? loopIdx : Math.max(1, loopIdx - 1)}</strong>{" "}
-              <Typography
-                component="span"
-                variant="caption"
-                sx={{ ml: 0.5, color: "text.secondary" }}
-              >
-                {loopOn ? "(running)" : ""}
-              </Typography>
-            </Typography>
-          </Stack>
-        </Stack>
-
-        {/* Active ZUPT countdown */}
-        {active && (
-          <Box textAlign="center" mb={2}>
-            <CountdownRing
-              secondsLeft={remain}
-              total={active.wait || 0}
-              size={isMobile ? 80 : 130}
-              stroke={isMobile ? 6 : 8}
-            />
-            <Typography
-              variant="h6"
+            {activePlan?.name && (
+              <Chip
+                size="small"
+                label={activePlan.name}
+                sx={{
+                  bgcolor: "rgba(99,102,241,0.10)",
+                  border: "1px solid rgba(99,102,241,0.35)",
+                  color: "text.primary",
+                  fontWeight: 500,
+                }}
+              />
+            )}
+            <Chip
+              size="small"
+              label={`${toDateSafe(startedAt).toLocaleDateString(undefined, {
+                month: "short",
+                day: "numeric",
+                hour: "2-digit",
+                minute: "2-digit",
+              })}`}
               sx={{
-                mt: 1,
-                display: "flex",
-                justifyContent: "center",
-                alignItems: "center",
-                gap: 1,
+                bgcolor: "rgba(99,102,241,0.10)",
+                border: "1px solid rgba(99,102,241,0.35)",
+                color: "text.primary",
+                fontWeight: 500,
               }}
-            >
-              <LocationIcon fontSize="small" /> {active.name}
-              <IconButton
-                onClick={undoLast}
-                size={isMobile ? "small" : "medium"}
-                sx={{ color: "error.main", ml: 0.5 }}
+            />
+          </Stack>
+
+          {/* Elapsed / Lap strip */}
+          <Stack
+            direction="row"
+            alignItems="center"
+            justifyContent="space-between"
+            sx={{ mb: isMobile ? 1 : 2 }}
+          >
+            <Stack direction="row" alignItems="center" spacing={1}>
+              <TimerIcon fontSize="small" sx={{ color: "primary.main" }} />
+              <Typography variant="subtitle1" sx={{ fontWeight: 600 }}>
+                Elapsed: <strong>{lap}</strong>
+              </Typography>
+            </Stack>
+
+            <Stack direction="row" alignItems="center" spacing={1}>
+              <LocationIcon
+                fontSize="small"
+                sx={{ color: loopOn ? "error.main" : "text.secondary" }}
+              />
+              <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>
+                Current Lap: <strong>L{loopOn ? loopIdx : Math.max(1, loopIdx - 1)}</strong>{" "}
+                <Typography
+                  component="span"
+                  variant="caption"
+                  sx={{ ml: 0.5, color: "text.secondary" }}
+                >
+                  {loopOn ? "(running)" : ""}
+                </Typography>
+              </Typography>
+            </Stack>
+          </Stack>
+
+          {/* Active ZUPT countdown */}
+          {active && (
+            <Box textAlign="center" mb={2}>
+              <CountdownRing
+                secondsLeft={remain}
+                total={active.wait || 0}
+                size={isMobile ? 80 : 130}
+                stroke={isMobile ? 6 : 8}
+              />
+              <Typography
+                variant="h6"
+                sx={{
+                  mt: 1,
+                  display: "flex",
+                  justifyContent: "center",
+                  alignItems: "center",
+                  gap: 1,
+                }}
               >
-                <UndoIcon />
-              </IconButton>
-            </Typography>
-          </Box>
-        )}
-
-        <Divider sx={{ my: 2 }} />
-
-        {/* ZUPT chips */}
-        <Box sx={{ display: "flex", alignItems: "center", mb: 1 }}>
-          <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>
-            Select ZUPT location:
-          </Typography>
-          <IconButton
-            size="small"
-            sx={{ ml: 0.5 }}
-            onClick={() => setReverse((p) => !p)}
-            title="Flip order"
-          >
-            <SwapVertIcon fontSize="inherit" sx={{ transform: "rotate(90deg)" }} />
-          </IconButton>
-        </Box>
-
-        <Box sx={{ display: "flex", gap: 1, overflowX: "auto", py: 1 }}>
-          {(reverse ? [...(activePlan.zupts || [])].reverse() : activePlan.zupts || []).map(
-            (z, i) => {
-              const done = captured.has(z.name);
-              const disabled = timerRunning || done;
-              return (
-                <Chip
-                  key={z.id || z.name}
-                  label={z.name}
-                  icon={done ? <CheckIcon /> : <TimerIcon />}
-                  color={done ? chipTone(i) : "default"}
-                  variant={done ? "filled" : "outlined"}
-                  clickable={!disabled}
-                  onClick={!disabled ? () => clickZ(z) : undefined}
-                />
-              );
-            }
+                <LocationIcon fontSize="small" /> {active.name}
+                <IconButton
+                  onClick={undoLast}
+                  size={isMobile ? "small" : "medium"}
+                  sx={{ color: "error.main", ml: 0.5 }}
+                >
+                  <UndoIcon />
+                </IconButton>
+              </Typography>
+            </Box>
           )}
-        </Box>
 
-        {/* Stamps table */}
-        {!!stamps.length && (
-          <Box mt={4} mb={12}>
+          <Divider sx={{ my: 2 }} />
+
+          {/* ZUPT chips */}
+          <Box sx={{ display: "flex", alignItems: "center", mb: 1 }}>
             <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>
-              Recorded timestamps:
+              Select ZUPT location:
             </Typography>
-            <TableContainer
-              component={Paper}
-              variant="outlined"
-              sx={{ maxHeight: 240, mb: 2, pb: 8 }}
+            <IconButton
+              size="small"
+              sx={{ ml: 0.5 }}
+              onClick={() => setReverse((p) => !p)}
+              title="Flip order"
             >
-              <Table size="small" stickyHeader>
-                <TableHead>
-                  <TableRow>
-                    <TableCell>Name</TableCell>
-                    <TableCell>Time&nbsp;({tz})</TableCell>
-                    <TableCell>Dur&nbsp;(s)</TableCell>
-                  </TableRow>
-                </TableHead>
-                <TableBody>
-                  {stamps.map((t, i) => (
-                    <TableRow key={i}>
-                      <TableCell>{t.zuptName}</TableCell>
-                      <TableCell>{fmt(toDateSafe(t.time))}</TableCell>
-                      <TableCell>{t.duration}</TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </TableContainer>
+              <SwapVertIcon fontSize="inherit" sx={{ transform: "rotate(90deg)" }} />
+            </IconButton>
           </Box>
-        )}
-      </>
-    )}
 
-    {/* ───────────────── Sticky Action Bar ───────────────── */}
-    {startedAt && (
-      <Paper
-        elevation={6}
-        sx={{
-          position: "fixed",
-          bottom: 20,
-          left: "50%",
-          transform: "translateX(-50%)",
-          width: isMobile ? "calc(100% - 16px)" : "min(640px,90%)",
-          p: isMobile ? 1.2 : 2,
-          borderRadius: 4,
-          backgroundColor: "rgba(255,255,255,0.15)",
-          border: "1px solid rgba(255,255,255,0.25)",
-          backdropFilter: "blur(5px)",
-          WebkitBackdropFilter: "blur(5px)",
-          zIndex: theme.zIndex.drawer + 2,
-        }}
+          <Box sx={{ display: "flex", gap: 1, overflowX: "auto", py: 1 }}>
+            {(reverse ? [...(activePlan.zupts || [])].reverse() : activePlan.zupts || []).map(
+              (z, i) => {
+                const done = captured.has(z.name);
+                const disabled = timerRunning || done;
+                return (
+                  <Chip
+                    key={z.id || z.name}
+                    label={z.name}
+                    icon={done ? <CheckIcon /> : <TimerIcon />}
+                    color={done ? chipTone(i) : "default"}
+                    variant={done ? "filled" : "outlined"}
+                    clickable={!disabled}
+                    onClick={!disabled ? () => clickZ(z) : undefined}
+                  />
+                );
+              }
+            )}
+          </Box>
+
+          {/* Stamps table */}
+          {!!stamps.length && (
+            <Box mt={4} mb={12}>
+              <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>
+                Recorded timestamps:
+              </Typography>
+              <TableContainer
+                component={Paper}
+                variant="outlined"
+                sx={{ maxHeight: 240, mb: 2, pb: 8 }}
+              >
+                <Table size="small" stickyHeader>
+                  <TableHead>
+                    <TableRow>
+                      <TableCell>Name</TableCell>
+                      <TableCell>Time&nbsp;({tz})</TableCell>
+                      <TableCell>Dur&nbsp;(s)</TableCell>
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    {stamps.map((t, i) => (
+                      <TableRow key={i}>
+                        <TableCell>{t.zuptName}</TableCell>
+                        <TableCell>{fmt(toDateSafe(t.time))}</TableCell>
+                        <TableCell>{t.duration}</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </TableContainer>
+            </Box>
+          )}
+        </>
+      )}
+
+      {/* ───────────────── Sticky Action Bar ───────────────── */}
+      {startedAt && (
+        <Paper
+          elevation={6}
+          sx={{
+            position: "fixed",
+            bottom: 20,
+            left: "50%",
+            transform: "translateX(-50%)",
+            width: isMobile ? "calc(100% - 16px)" : "min(640px,90%)",
+            p: isMobile ? 1.2 : 2,
+            borderRadius: 4,
+            backgroundColor: "rgba(255,255,255,0.15)",
+            border: "1px solid rgba(255,255,255,0.25)",
+            backdropFilter: "blur(5px)",
+            WebkitBackdropFilter: "blur(5px)",
+            zIndex: theme.zIndex.drawer + 2,
+          }}
+        >
+          <Stack direction="row" spacing={isMobile ? 1 : 2} justifyContent="center" flexWrap="wrap">
+            <Button
+              fullWidth={isMobile}
+              sx={{ flex: isMobile ? 1 : undefined, py: 1.5 }}
+              variant="contained"
+              color={loopOn ? "error" : "primary"}
+              startIcon={loopOn ? <StopIcon /> : <LocationIcon />}
+              onClick={toggleLoop}
+              size={isMobile ? "small" : "medium"}
+            >
+              {loopOn ? `Stop L${loopIdx}` : `Record L${loopIdx}`}
+            </Button>
+
+            <Button
+              fullWidth={isMobile}
+              sx={{ flex: isMobile ? 1 : undefined }}
+              variant="outlined"
+              startIcon={<AddIcon />}
+              onClick={manual}
+              disabled={timerRunning}
+              size={isMobile ? "small" : "medium"}
+            >
+              Manual
+            </Button>
+
+            <Button
+              fullWidth={isMobile}
+              sx={{ flex: isMobile ? 1 : undefined }}
+              variant="contained"
+              color="success"
+              startIcon={<DoneAllIcon />}
+              onClick={finish}
+              size={isMobile ? "small" : "medium"}
+            >
+              Finish
+            </Button>
+          </Stack>
+        </Paper>
+      )}
+
+      {/* ───────────────── Snackbars & Dialogs ───────────────── */}
+      <Snackbar
+        open={!!snack}
+        autoHideDuration={2400}
+        onClose={() => setSnack("")}
+        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
       >
-        <Stack direction="row" spacing={isMobile ? 1 : 2} justifyContent="center" flexWrap="wrap">
-          <Button
-            fullWidth={isMobile}
-            sx={{ flex: isMobile ? 1 : undefined, py: 1.5 }}
-            variant="contained"
-            color={loopOn ? "error" : "primary"}
-            startIcon={loopOn ? <StopIcon /> : <LocationIcon />}
-            onClick={toggleLoop}
-            size={isMobile ? "small" : "medium"}
-          >
-            {loopOn ? `Stop L${loopIdx}` : `Record L${loopIdx}`}
-          </Button>
+        <Alert severity="success" variant="filled" sx={{ width: "100%" }}>
+          {snack}
+        </Alert>
+      </Snackbar>
 
-          <Button
-            fullWidth={isMobile}
-            sx={{ flex: isMobile ? 1 : undefined }}
-            variant="outlined"
-            startIcon={<AddIcon />}
-            onClick={manual}
-            disabled={timerRunning}
-            size={isMobile ? "small" : "medium"}
-          >
-            Manual
-          </Button>
+      {/* Compact Status Dialogs */}
+      <Dialog open={openPanel === "net"} onClose={() => setOpenPanel(null)} maxWidth="xs" fullWidth>
+        <DialogTitle>Network status</DialogTitle>
+        <DialogContent dividers>
+          <Typography variant="body2">
+            You’re offline because the network is unavailable. Actions are queued locally and will upload automatically when you’re
+            back online.
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setOpenPanel(null)}>Close</Button>
+        </DialogActions>
+      </Dialog>
 
-          <Button
-            fullWidth={isMobile}
-            sx={{ flex: isMobile ? 1 : undefined }}
-            variant="contained"
-            color="success"
-            startIcon={<DoneAllIcon />}
-            onClick={finish}
-            size={isMobile ? "small" : "medium"}
-          >
-            Finish
-          </Button>
-        </Stack>
-      </Paper>
-    )}
+      <Dialog open={openPanel === "queued"} onClose={() => setOpenPanel(null)} maxWidth="xs" fullWidth>
+        <DialogTitle>Queued changes</DialogTitle>
+        <DialogContent dividers>
+          <Typography variant="body2">
+            {queuedCount === 0
+              ? "No queued changes."
+              : `${queuedCount} change${queuedCount > 1 ? "s" : ""} will upload when you’re back online.`}
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setOpenPanel(null)}>Close</Button>
+        </DialogActions>
+      </Dialog>
 
-    {/* ───────────────── Snackbars & Dialogs ───────────────── */}
-    <Snackbar
-      open={!!snack}
-      autoHideDuration={2400}
-      onClose={() => setSnack("")}
-      anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
-    >
-      <Alert severity="success" variant="filled" sx={{ width: "100%" }}>
-        {snack}
-      </Alert>
-    </Snackbar>
-
-    {/* Compact Status Dialogs */}
-    <Dialog open={openPanel === "net"} onClose={() => setOpenPanel(null)} maxWidth="xs" fullWidth>
-      <DialogTitle>Network status</DialogTitle>
-      <DialogContent dividers>
-        <Typography variant="body2">
-          You’re offline because the network is unavailable. Actions are queued locally and will upload automatically when you’re
-          back online.
-        </Typography>
-      </DialogContent>
-      <DialogActions>
-        <Button onClick={() => setOpenPanel(null)}>Close</Button>
-      </DialogActions>
-    </Dialog>
-
-    <Dialog open={openPanel === "queued"} onClose={() => setOpenPanel(null)} maxWidth="xs" fullWidth>
-      <DialogTitle>Queued changes</DialogTitle>
-      <DialogContent dividers>
-        <Typography variant="body2">
-          {queuedCount === 0
-            ? "No queued changes."
-            : `${queuedCount} change${queuedCount > 1 ? "s" : ""} will upload when you’re back online.`}
-        </Typography>
-      </DialogContent>
-      <DialogActions>
-        <Button onClick={() => setOpenPanel(null)}>Close</Button>
-      </DialogActions>
-    </Dialog>
-
-    <Dialog open={openPanel === "finished"} onClose={() => setOpenPanel(null)} maxWidth="xs" fullWidth>
-      <DialogTitle>Finished (pending upload)</DialogTitle>
-      <DialogContent dividers>
-        <Typography variant="body2">
-          {finishedCount === 0
-            ? "No finished sessions pending."
-            : `${finishedCount} finished session${finishedCount > 1 ? "s are" : " is"} waiting to upload.`}
-        </Typography>
-      </DialogContent>
-      <DialogActions>
-        <Button onClick={() => setOpenPanel(null)}>Close</Button>
-      </DialogActions>
-    </Dialog>
-  </Box>
-);
+      <Dialog open={openPanel === "finished"} onClose={() => setOpenPanel(null)} maxWidth="xs" fullWidth>
+        <DialogTitle>Finished (pending upload)</DialogTitle>
+        <DialogContent dividers>
+          <Typography variant="body2">
+            {finishedCount === 0
+              ? "No finished sessions pending."
+              : `${finishedCount} finished session${finishedCount > 1 ? "s are" : " is"} waiting to upload.`}
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setOpenPanel(null)}>Close</Button>
+        </DialogActions>
+      </Dialog>
+    </Box>
+  );
 }
