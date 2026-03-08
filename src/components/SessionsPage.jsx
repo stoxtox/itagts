@@ -419,13 +419,17 @@ export default function SessionsPage() {
                     <Typography variant="caption" color="text.secondary">
                       {shortDate(s.startedAt)}
                     </Typography>
-                    <Box sx={{
+                    <Box sx={(t) => ({
                       display: "inline-flex", alignItems: "center",
-                      bgcolor: stampCount > 0 ? "primary.50" : "grey.100",
-                      color: stampCount > 0 ? "primary.main" : "text.disabled",
+                      bgcolor: stampCount > 0
+                        ? (t.palette.mode === "dark" ? "rgba(99,102,241,0.18)" : "primary.50")
+                        : (t.palette.mode === "dark" ? "rgba(255,255,255,0.08)" : "grey.100"),
+                      color: stampCount > 0
+                        ? (t.palette.mode === "dark" ? "primary.light" : "primary.main")
+                        : "text.disabled",
                       borderRadius: 1, px: 0.75, py: 0.1,
                       fontSize: 11, fontWeight: 600,
-                    }}>
+                    })}>
                       {stampCount} ZUPT{stampCount !== 1 ? "s" : ""}
                     </Box>
                     {planDeleted ? (
