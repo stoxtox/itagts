@@ -1,5 +1,6 @@
 import React from "react";
 import ReactDOM from "react-dom/client"; // ✅ this is the fix
+import "leaflet/dist/leaflet.css";
 import App from "./App";
 import { AuthProvider } from "./contexts/AuthContext";
 

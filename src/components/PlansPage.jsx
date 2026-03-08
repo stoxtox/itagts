@@ -4,7 +4,7 @@ import {
   Box, Typography, List, ListItem, ListItemText, IconButton, Button,
   Dialog, DialogTitle, DialogContent, TextField, Stack, Divider,
   CircularProgress, Snackbar, Alert, Paper, ListItemSecondaryAction,
-  useTheme, useMediaQuery, Tooltip, Grid
+  useTheme, useMediaQuery, Tooltip, Grid, Skeleton
 } from "@mui/material";
 import EditIcon          from "@mui/icons-material/Edit";
 import DownloadIcon      from "@mui/icons-material/Download";
@@ -13,6 +13,8 @@ import DeleteForeverIcon from "@mui/icons-material/DeleteForever";
 import DragIndicatorIcon from "@mui/icons-material/DragIndicator";
 import ArrowUpwardIcon   from "@mui/icons-material/ArrowUpward";
 import ArrowDownwardIcon from "@mui/icons-material/ArrowDownward";
+import DescriptionIcon   from "@mui/icons-material/Description";
+import ContentCopyIcon   from "@mui/icons-material/ContentCopy";
 
 import { db } from "../firebase";
 import {
@@ -97,6 +99,29 @@ export default function PlansPage() {
       href:url, download:`Plan-${p.name||p.id}.json`
     }).click();
     URL.revokeObjectURL(url);
+  };
+
+  /* clone / duplicate */
+  const clonePlan = async (p) => {
+    try {
+      const cloned = {
+        uid: user.uid,
+        planUid: uuid(),
+        name: `${p.name}_copy`,
+        anchors: p.anchors ? { ...p.anchors } : null,
+        zupts: (p.zupts || []).map(z => ({
+          ...z,
+          id: uuid(),
+        })),
+        createdAt: Timestamp.now(),
+      };
+      await addDoc(collection(db, "plans"), cloned);
+      fetchPlans();
+      setSnack("Plan cloned successfully");
+    } catch (err) {
+      console.error(err);
+      setSnack("Clone failed");
+    }
   };
 
   /* import (sanitize plan name to no-spaces) */
@@ -277,7 +302,21 @@ export default function PlansPage() {
     setZuptTouched(items => arrayMove(items, oldIndex, newIndex));
   };
 
-  if (!plans) return <CircularProgress />;
+  if (!plans) return (
+    <Box>
+      <Stack spacing={1.5}>
+        {[1,2,3].map(i => (
+          <Paper key={i} variant="outlined" sx={{ p: 2, borderLeftWidth: 4, borderLeftColor: "secondary.light" }}>
+            <Skeleton variant="text" width="45%" height={24} />
+            <Stack direction="row" spacing={1} mt={1}>
+              <Skeleton variant="rounded" width={60} height={20} />
+              <Skeleton variant="text" width={100} height={20} />
+            </Stack>
+          </Paper>
+        ))}
+      </Stack>
+    </Box>
+  );
 
   /* ─── UI ─── */
   return (
@@ -288,16 +327,12 @@ export default function PlansPage() {
         style={{ display:"none" }} onChange={handleImportFile}
       />
 
-      {/* header */}
-      <Stack
-        direction={isMobile ? "column" : "row"}
-        justifyContent="space-between"
-        spacing={isMobile ? 1 : 0}
-        mb={2}
-      >
-        <Typography variant="h6">Your Plans</Typography>
+            {/* header */}
+      <Stack direction="row" alignItems="center" justifyContent="space-between" mb={2}>
+        <Typography variant="body2" color="text.secondary" fontWeight={500}>
+          {plans.length} plan{plans.length !== 1 ? "s" : ""}
+        </Typography>
         <Button
-          fullWidth={isMobile}
           size="small"
           variant="contained"
           color="secondary"
@@ -311,66 +346,88 @@ export default function PlansPage() {
 
       {/* list or empty-state */}
       {plans.length ? (
-        <Paper variant="outlined">
-          <List dense>
-            {plans.map(p => (
-              <ListItem key={p.id} sx={{ alignItems:"flex-start" }}>
-                <ListItemText
-                  primary={p.name}
-                  secondary={
-                    <>
-                      {p.zupts?.length || 0} ZUPTs | PlanUID:{" "}
-                      {p.planUid ? p.planUid.slice(-11).toUpperCase() : "—"}
-                      <br />
-                    </>
-                  }
-                />
-                <ListItemSecondaryAction>
-                  <Stack direction="row" spacing={0.5}>
-                    <Tooltip title="Export JSON">
-                      <IconButton size="small" onClick={() => exportPlan(p)}>
-                        <DownloadIcon fontSize="small" />
+        <Stack spacing={1.5}>
+          {plans.map(p => {
+            const zuptCount = p.zupts?.length || 0;
+            return (
+              <Paper
+                key={p.id}
+                variant="outlined"
+                sx={{
+                  p: 0, overflow: "hidden",
+                  borderLeftWidth: 4,
+                  borderLeftColor: "secondary.light",
+                  transition: "all 0.15s ease",
+                  "&:hover": { borderColor: "primary.light", boxShadow: "0 2px 8px rgba(79,70,229,0.08)" },
+                }}
+              >
+                <Stack direction="row" alignItems="stretch">
+                  <Box
+                    onClick={() => startEdit(p)}
+                    sx={{
+                      flex: 1, py: 1.5, px: 2, cursor: "pointer",
+                      minWidth: 0,
+                      "&:hover": { bgcolor: "action.hover" },
+                    }}
+                  >
+                    <Typography sx={{ fontSize: 15, fontWeight: 600, lineHeight: 1.3 }} noWrap>
+                      {p.name}
+                    </Typography>
+                    <Stack direction="row" spacing={1} alignItems="center" mt={0.5} flexWrap="wrap">
+                      <Box sx={{
+                        display: "inline-flex", alignItems: "center",
+                        bgcolor: zuptCount > 0 ? "primary.50" : "grey.100",
+                        color: zuptCount > 0 ? "primary.main" : "text.disabled",
+                        borderRadius: 1, px: 0.75, py: 0.1,
+                        fontSize: 11, fontWeight: 600,
+                      }}>
+                        {zuptCount} ZUPT{zuptCount !== 1 ? "s" : ""}
+                      </Box>
+                      <Typography variant="caption" color="text.disabled" noWrap>
+                        {p.planUid ? p.planUid.slice(-8).toUpperCase() : "—"}
+                      </Typography>
+                    </Stack>
+                  </Box>
+                  <Stack direction="row" alignItems="center" spacing={0} sx={{ pr: 0.5 }}>
+                    <Tooltip title="Clone">
+                      <IconButton size="small" onClick={() => clonePlan(p)}>
+                        <ContentCopyIcon sx={{ fontSize: 18 }} />
                       </IconButton>
                     </Tooltip>
-                    <Tooltip title="Edit">
-                      <IconButton size="small" onClick={() => startEdit(p)}>
-                        <EditIcon fontSize="small" />
+                    <Tooltip title="Export JSON">
+                      <IconButton size="small" onClick={() => exportPlan(p)}>
+                        <DownloadIcon sx={{ fontSize: 18 }} />
                       </IconButton>
                     </Tooltip>
                     <Tooltip title="Delete">
-                      <IconButton
-                        size="small"
-                        color="error"
-                        onClick={() => deletePlan(p)}
-                      >
-                        <DeleteForeverIcon fontSize="small" />
+                      <IconButton size="small" color="error" onClick={() => deletePlan(p)}>
+                        <DeleteForeverIcon sx={{ fontSize: 18 }} />
                       </IconButton>
                     </Tooltip>
                   </Stack>
-                </ListItemSecondaryAction>
-              </ListItem>
-            ))}
-          </List>
-        </Paper>
+                </Stack>
+              </Paper>
+            );
+          })}
+        </Stack>
       ) : (
-        <Paper
-          variant="outlined"
-          sx={{ p:3, textAlign:"center", bgcolor:"background.default" }}
-        >
-          <Typography>No plans saved yet.</Typography>
-          <Typography variant="body2" sx={{ mt:1 }}>
-            Import a plan file to get started.
+        <Box sx={{ textAlign: "center", py: 6 }}>
+          <DescriptionIcon sx={{ fontSize: 48, color: "text.disabled", mb: 1 }} />
+          <Typography variant="h6" color="text.secondary" fontWeight={600}>
+            No plans yet
+          </Typography>
+          <Typography variant="body2" color="text.disabled" sx={{ mt: 0.5, mb: 2 }}>
+            Create a plan in the Creator tab or import one.
           </Typography>
           <Button
             size="small"
             variant="contained"
-            sx={{ mt:2 }}
             startIcon={<UploadIcon />}
             onClick={() => fileRef.current?.click()}
           >
             Import plan
           </Button>
-        </Paper>
+        </Box>
       )}
 
       {/* edit dialog */}
@@ -480,8 +537,9 @@ function SortableZuptRow({
       sx={{
         p: isMobile ? 1.5 : 2,
         mb: 2,
-        borderLeft: "5px solid #6366f1",
-        bgcolor: isMobile ? "grey.50" : undefined,
+        borderLeft: "5px solid",
+        borderLeftColor: "secondary.main",
+        bgcolor: isMobile ? "action.hover" : undefined,
         cursor: "grab"
       }}
     >
@@ -514,7 +572,7 @@ function SortableZuptRow({
       {/* 3-row layout */}
       <Grid container spacing={2}>
         {/* Row 1: Name */}
-        <Grid item xs={12}>
+        <Grid size={12}>
           <TextField
             fullWidth
             label="Name"
@@ -528,7 +586,7 @@ function SortableZuptRow({
         </Grid>
 
         {/* Row 2: Lat / Lon */}
-        <Grid item xs={12} sm={6}>
+        <Grid size={{ xs: 12, sm: 6 }}>
           <TextField
             fullWidth
             label="Latitude"
@@ -540,7 +598,7 @@ function SortableZuptRow({
             onBlur={e => handleLatLonBlur(index, "lat", e.target.value)}
           />
         </Grid>
-        <Grid item xs={12} sm={6}>
+        <Grid size={{ xs: 12, sm: 6 }}>
           <TextField
             fullWidth
             label="Longitude"
@@ -554,7 +612,7 @@ function SortableZuptRow({
         </Grid>
 
         {/* Row 3: Wait / Height */}
-        <Grid item xs={12} sm={6}>
+        <Grid size={{ xs: 12, sm: 6 }}>
           <TextField
             fullWidth
             label="Wait (s)"
@@ -566,7 +624,7 @@ function SortableZuptRow({
             onBlur={() => markZuptTouched(index, "wait")}
           />
         </Grid>
-        <Grid item xs={12} sm={6}>
+        <Grid size={{ xs: 12, sm: 6 }}>
           <TextField
             fullWidth
             label="Height (m)"

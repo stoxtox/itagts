@@ -1,7 +1,7 @@
 // src/components/PlanBuilder.jsx
 // DnD reorder + insert above/below + no upfront errors (touched/submit-gated)
 // no spaces in names, 6dp lat/lon, 3-row ZUPT layout, unique names,
-// snackbar + save tooltip.
+// snackbar + save tooltip + KML import.
 
 import React, { useMemo, useState } from "react";
 import {
@@ -14,6 +14,7 @@ import DeleteIcon from "@mui/icons-material/DeleteOutline";
 import DragIndicatorIcon from "@mui/icons-material/DragIndicator";
 import ArrowUpwardIcon from "@mui/icons-material/ArrowUpward";
 import ArrowDownwardIcon from "@mui/icons-material/ArrowDownward";
+import UploadFileIcon from "@mui/icons-material/UploadFile";
 
 import { db } from "../firebase";
 import { collection, addDoc, Timestamp } from "firebase/firestore";
@@ -67,7 +68,7 @@ export default function PlanBuilder() {
   // touch / submit gating
   const [submitAttempted, setSubmitAttempted] = useState(false);
   const [anchorTouched, setAnchorTouched] = useState({ A1:false, A2:false, A3:false, B1:false, B2:false, B3:false });
-  const [zuptTouched, setZuptTouched] = useState([]); // [{name:false, lat:false, lon:false, height:false, wait:false}, ...]
+  const [zuptTouched, setZuptTouched] = useState([]);
   const [planTouched, setPlanTouched] = useState(false);
 
   // Snackbar UX
@@ -114,6 +115,43 @@ export default function PlanBuilder() {
     updateZupt(i, key, String(sixDP(value)));
   };
 
+  /* ---------- KML Import ---------- */
+  const handleImportKml = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    try {
+      const text = await file.text();
+      const parser = new DOMParser();
+      const xmlDoc = parser.parseFromString(text, "application/xml");
+
+      const placemarks = Array.from(xmlDoc.getElementsByTagName("Placemark"));
+
+      const newZupts = placemarks.map(pm => {
+        const name = pm.getElementsByTagName("name")[0]?.textContent ?? "";
+        const coords = pm.getElementsByTagName("coordinates")[0]?.textContent ?? "";
+        const [lon, lat, height] = coords.split(",").map(v => v.trim());
+
+        return {
+          id: crypto.randomUUID?.() ?? `${Date.now()}-${Math.random()}`,
+          name: name.replace(/\s+/g, ""), // enforce no spaces
+          lat: sixDP(lat),
+          lon: sixDP(lon),
+          height: height ? +height : 0,
+          wait: 0
+        };
+      });
+
+      setZupts(newZupts);
+      setZuptTouched(newZupts.map(() => ({ name:false, lat:false, lon:false, height:false, wait:false })));
+
+      showSnack("✅ KML imported!");
+    } catch (err) {
+      console.error(err);
+      showSnack("Failed to import KML", "error");
+    }
+  };
+
   /* ---------- validation ---------- */
   const rawAnchorErr = v => {
     if (v === "") return "Required";
@@ -121,7 +159,7 @@ export default function PlanBuilder() {
     return "";
   };
 
-  // name duplicate map (case-insensitive)
+  // name duplicate map
   const nameCounts = useMemo(() => {
     const m = new Map();
     zupts.forEach(z => {
@@ -134,19 +172,15 @@ export default function PlanBuilder() {
 
   const rawZuptErr = z => {
     const errs = { name:"", lat:"", lon:"", height:"", wait:"" };
-    // name: required, no spaces, unique
     if (z.name === "") errs.name = "Required";
     else if (!noSpace(z.name)) errs.name = "No spaces";
     else if ((nameCounts.get(z.name.trim().toLowerCase()) || 0) > 1) errs.name = "Duplicate";
-    // lat/lon
     if (z.lat === "") errs.lat = "Required";
     else if (!inRange(z.lat, -90, 90)) errs.lat = "-90…90";
     if (z.lon === "") errs.lon = "Required";
     else if (!inRange(z.lon, -180, 180)) errs.lon = "-180…180";
-    // height
     if (z.height === "") errs.height = "Required";
     else if (!isNum(z.height)) errs.height = "Number";
-    // wait
     if (z.wait === "") errs.wait = "Required";
     else if (!isNum(z.wait) || +z.wait < 0) errs.wait = "≥ 0";
     return errs;
@@ -157,12 +191,10 @@ export default function PlanBuilder() {
   );
   const zuptErrors = zupts.map(rawZuptErr);
 
-  // gated display of errors
   const showAnchorErr = (k) => {
     const val = anchors[k];
     const err = anchorErrors[k];
     if (!err) return "";
-    // show immediately for non-empty invalid; "Required" only after touch/submit
     if (val !== "" && err !== "Required") return err;
     if ((anchorTouched[k] || submitAttempted) && err) return err;
     return "";
@@ -177,7 +209,6 @@ export default function PlanBuilder() {
     return "";
   };
 
-  // plan name: required, no spaces (we also sanitize input to prevent spaces)
   const planNameErrRaw = (() => {
     if (planName === "") return "Required";
     if (!noSpace(planName)) return "No spaces";
@@ -198,7 +229,6 @@ export default function PlanBuilder() {
   const hasZupts        = zupts.length > 0;
   const formOK = !planNameErrRaw && !hasAnchorErrors && hasZupts && !hasZuptErrors;
 
-  // reason for disabled Save (tooltip)
   const disabledReason = useMemo(() => {
     if (!planName || !!planNameErrRaw) return "Enter a Plan Name (no spaces).";
     if (hasAnchorErrors) return "Fix anchor fields (numbers required).";
@@ -207,7 +237,7 @@ export default function PlanBuilder() {
     return "";
   }, [planName, planNameErrRaw, hasAnchorErrors, hasZupts, hasZuptErrors]);
 
-  /* ---------- DND: sensors + reorder ---------- */
+  /* ---------- DND ---------- */
   const sensors = useSensors(
     useSensor(MouseSensor, { activationConstraint: { distance: 5 } }),
     useSensor(TouchSensor, { activationConstraint: { delay: 75, tolerance: 5 } }),
@@ -236,7 +266,7 @@ export default function PlanBuilder() {
     const docBody = {
       uid: user.uid,
       planUid: crypto.randomUUID?.() ?? `${Date.now()}-${Math.random()}`,
-      name: planName, // no spaces by enforcement
+      name: planName,
       anchors: Object.fromEntries(Object.entries(anchors).map(([k, v]) => [k, +v])),
       zupts: zupts.map(z => ({
         id: z.id, name: z.name,
@@ -262,32 +292,19 @@ export default function PlanBuilder() {
     }
   };
 
-  /* ---------- UI helpers ---------- */
-  const renderAnchor = k => {
-    const errText = showAnchorErr(k);
-    return (
-      <TextField
-        key={k}
-        label={anchorLabels[k]}
-        type="number"
-        value={anchors[k]}
-        error={!!errText}
-        helperText={errText || " "}
-        onChange={e => updateAnchor(k, e.target.value)}
-        onBlur={() => markAnchorTouched(k)}
-        size="small"
-        inputProps={{ step: "0.1" }}
-        sx={{ flex: 1, minWidth: 120 }}
-      />
-    );
-  };
-
   /* ---------- UI ---------- */
   return (
     <Box sx={{ maxWidth: isMobile ? "100%" : 900, mx: "auto", px: isMobile ? 1 : 2 }}>
-      <Typography variant="h6" gutterBottom>Create a Timestamp Plan</Typography>
-
-      {/* Plan Name (no spaces) */}
+      {/* ─── Step 1: Plan Name ─── */}
+      <Stack direction="row" spacing={1} alignItems="center" mb={1.5}>
+        <Box sx={{
+          width: 24, height: 24, borderRadius: "50%",
+          bgcolor: "primary.main", color: "white",
+          display: "flex", alignItems: "center", justifyContent: "center",
+          fontSize: 13, fontWeight: 700,
+        }}>1</Box>
+        <Typography variant="subtitle1" fontWeight={600}>Name your plan</Typography>
+      </Stack>
       <TextField
         label="Plan Name"
         fullWidth
@@ -300,29 +317,48 @@ export default function PlanBuilder() {
         onKeyDown={(e) => { if (e.key === " ") e.preventDefault(); }}
       />
 
-      <Typography variant="subtitle2" gutterBottom>
-        Anchor Points (A = SDs, B = Lever Arm [m])
-      </Typography>
+      {/* ─── Step 2: Anchor Points ─── */}
+      <Stack direction="row" spacing={1} alignItems="center" mb={1.5}>
+        <Box sx={{
+          width: 24, height: 24, borderRadius: "50%",
+          bgcolor: "primary.main", color: "white",
+          display: "flex", alignItems: "center", justifyContent: "center",
+          fontSize: 13, fontWeight: 700,
+        }}>2</Box>
+        <Typography variant="subtitle1" fontWeight={600}>Anchor points</Typography>
+        <Typography variant="caption" color="text.secondary">(A = SDs, B = Lever Arm [m])</Typography>
+      </Stack>
 
-      {/* Anchors — responsive rows */}
-      {isMobile ? (
-        <>
-          <Stack direction="row" spacing={2} sx={{ mb: 1 }}>
-            {["A1", "A2", "A3"].map(renderAnchor)}
-          </Stack>
-          <Stack direction="row" spacing={2} sx={{ mb: 3 }}>
-            {["B1", "B2", "B3"].map(renderAnchor)}
-          </Stack>
-        </>
-      ) : (
-        <Stack direction="row" spacing={2} sx={{ mb: 3 }}>
-          {["A1", "A2", "A3", "B1", "B2", "B3"].map(renderAnchor)}
-        </Stack>
-      )}
+      <Stack direction="row" spacing={2} sx={{ mb: 1 }}>
+        {["A1", "A2", "A3"].map(renderAnchor)}
+      </Stack>
+      <Stack direction="row" spacing={2} sx={{ mb: 3 }}>
+        {["B1", "B2", "B3"].map(renderAnchor)}
+      </Stack>
 
       <Divider sx={{ mb: 2 }} />
 
-      {/* ZUPTs with DnD */}
+      {/* ─── Step 3: ZUPTs ─── */}
+      <Stack direction="row" spacing={1} alignItems="center" mb={1.5}>
+        <Box sx={{
+          width: 24, height: 24, borderRadius: "50%",
+          bgcolor: "primary.main", color: "white",
+          display: "flex", alignItems: "center", justifyContent: "center",
+          fontSize: 13, fontWeight: 700,
+        }}>3</Box>
+        <Typography variant="subtitle1" fontWeight={600}>Add ZUPTs</Typography>
+        {zupts.length > 0 && (
+          <Box sx={{
+            bgcolor: "primary.50", color: "primary.main",
+            borderRadius: 1, px: 0.75, py: 0.1,
+            fontSize: 11, fontWeight: 600,
+          }}>
+            {zupts.length} added
+          </Box>
+        )}
+      </Stack>
+
+      {/* ZUPTs */}
       <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={onDragEnd}>
         <SortableContext items={zupts.map(z => z.id)} strategy={verticalListSortingStrategy}>
           {zupts.map((z, i) => (
@@ -347,6 +383,16 @@ export default function PlanBuilder() {
       <Stack direction={isMobile ? "column" : "row"} spacing={2} sx={{ mt: 2 }}>
         <Button variant="outlined" startIcon={<AddIcon />} fullWidth={isMobile} onClick={addZuptEnd}>
           Add ZUPT
+        </Button>
+
+        <Button
+          variant="outlined"
+          component="label"
+          startIcon={<UploadFileIcon />}
+          fullWidth={isMobile}
+        >
+          Import KML
+          <input type="file" hidden accept=".kml" onChange={handleImportKml} />
         </Button>
 
         <Tooltip title={!formOK ? disabledReason : ""} disableHoverListener={formOK}>
@@ -377,6 +423,26 @@ export default function PlanBuilder() {
       </Snackbar>
     </Box>
   );
+
+  /* ---------- UI helpers ---------- */
+  function renderAnchor(k) {
+    const errText = showAnchorErr(k);
+    return (
+      <TextField
+        key={k}
+        label={anchorLabels[k]}
+        type="number"
+        value={anchors[k]}
+        error={!!errText}
+        helperText={errText || " "}
+        onChange={e => updateAnchor(k, e.target.value)}
+        onBlur={() => markAnchorTouched(k)}
+        size="small"
+        inputProps={{ step: "0.1" }}
+        sx={{ flex: 1, minWidth: 120 }}
+      />
+    );
+  }
 }
 
 /* ---------- Sortable ZUPT Card ---------- */
@@ -403,8 +469,9 @@ function SortableZuptCard({
       sx={{
         p: isMobile ? 1.5 : 2,
         mb: 2,
-        borderLeft: "5px solid #6366f1",
-        bgcolor: isMobile ? "grey.50" : undefined,
+        borderLeft: "5px solid",
+        borderLeftColor: "secondary.main",
+        bgcolor: isMobile ? "action.hover" : undefined,
         cursor: "grab"
       }}
     >
@@ -436,8 +503,8 @@ function SortableZuptCard({
 
       {/* 3-row layout (responsive) */}
       <Grid container spacing={2}>
-        {/* Row 1: Name (full width) */}
-        <Grid item xs={12}>
+        {/* Row 1: Name */}
+        <Grid size={12}>
           <TextField
             fullWidth
             label="Name"
@@ -451,7 +518,7 @@ function SortableZuptCard({
         </Grid>
 
         {/* Row 2: Lat / Lon */}
-        <Grid item xs={12} sm={6}>
+        <Grid size={{ xs: 12, sm: 6 }}>
           <TextField
             fullWidth
             label="Latitude"
@@ -463,7 +530,7 @@ function SortableZuptCard({
             onBlur={e => handleLatLonBlur(index, "lat", e.target.value)}
           />
         </Grid>
-        <Grid item xs={12} sm={6}>
+        <Grid size={{ xs: 12, sm: 6 }}>
           <TextField
             fullWidth
             label="Longitude"
@@ -477,7 +544,7 @@ function SortableZuptCard({
         </Grid>
 
         {/* Row 3: Wait / Height */}
-        <Grid item xs={12} sm={6}>
+        <Grid size={{ xs: 12, sm: 6 }}>
           <TextField
             fullWidth
             label="Wait (s)"
@@ -489,7 +556,7 @@ function SortableZuptCard({
             onBlur={() => markZuptTouched(index, "wait")}
           />
         </Grid>
-        <Grid item xs={12} sm={6}>
+        <Grid size={{ xs: 12, sm: 6 }}>
           <TextField
             fullWidth
             label="Height (m)"

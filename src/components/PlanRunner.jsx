@@ -1,223 +1,57 @@
 // src/components/PlanRunner.jsx
-// Offline-first PlanRunner
-// - Requires "Record Lx" before any ZUPT
-// - Restores progress (lap & captured ZUPTs) after refresh (online/offline)
-// - Pure-local behavior when offline (no Firestore network attempts)
-// - Local outbox + local session index & stamps; auto-flush on reconnect (idempotent)
-// - Auto-resume only when OFFLINE (online never auto-opens)
-// - Compact header status row (only offline): cloud/pending/finished
-// - No geolocation
-// - Smooth UX: no hard reloads; instant badge/counter updates
+// Offline-first PlanRunner — orchestrator
+// Composes sub-components from runner/ and helpers from services/runnerHelpers.js
 
-import React, { useEffect, useState, useMemo } from "react";
+import React, { useEffect, useState, useMemo, useCallback } from "react";
 import {
-  Box, Paper, Button, Typography, MenuItem, TextField,
-  Divider, Stack, Chip, Snackbar, Alert, LinearProgress,
-  TableContainer, Table, TableHead, TableRow, TableCell, TableBody,
-  IconButton, useTheme, useMediaQuery, Tooltip, Badge,
-  Dialog, DialogTitle, DialogContent, DialogActions
+  Box, Typography, Stack, Chip, Divider,
+  Snackbar, Alert, IconButton,
+  Dialog, DialogTitle, DialogContent, DialogActions, Button,
+  useTheme, useMediaQuery
 } from "@mui/material";
-import PlayArrowIcon from "@mui/icons-material/PlayArrow";
-import StopIcon from "@mui/icons-material/Stop";
-import CheckIcon from "@mui/icons-material/CheckCircle";
-import LocationIcon from "@mui/icons-material/Room";
 import TimerIcon from "@mui/icons-material/Timer";
-import AddIcon from "@mui/icons-material/AddCircle";
-import DoneAllIcon from "@mui/icons-material/DoneAll";
+import LocationIcon from "@mui/icons-material/Room";
 import UndoIcon from "@mui/icons-material/Undo";
-import SwapVertIcon from "@mui/icons-material/SwapVert";
-import CloudOffIcon from "@mui/icons-material/CloudOff";
+import CheckCircleOutlineIcon from "@mui/icons-material/CheckCircleOutline";
+import CloudDoneIcon from "@mui/icons-material/CloudDone";
 import CloudUploadIcon from "@mui/icons-material/CloudUpload";
-import AssignmentTurnedInIcon from "@mui/icons-material/AssignmentTurnedIn";
-import OfflineBoltIcon from "@mui/icons-material/OfflineBolt";
 
-import LoaderOverlay from "./LoaderOverlay";
-
-import { db } from "../firebase";
+import { db, auth } from "../firebase";
 import {
   collection, getDocs, query, where, addDoc, updateDoc,
   doc, Timestamp, enableNetwork, disableNetwork
 } from "firebase/firestore";
-import { auth } from "../firebase";
 import { onAuthStateChanged } from "firebase/auth";
 
-/* ───────── SVG countdown ring ───────── */
-function CountdownRing({ secondsLeft, total, size = 96, stroke = 8 }) {
-  const r = (size - stroke) / 2;
-  const circ = 2 * Math.PI * r;
-  const pct = 1 - secondsLeft / total;
-  const off = circ * pct;
-  const color = pct < 0.33 ? "#10B981" : pct < 0.67 ? "#F59E0B" : "#EF4444";
-  return (
-    <svg width={size} height={size}>
-      <g transform={`rotate(-90 ${size / 2} ${size / 2})`}>
-        <circle r={r} cx={size / 2} cy={size / 2} fill="none" stroke="#E5E7EB" strokeWidth={stroke} />
-        <circle r={r} cx={size / 2} cy={size / 2} fill="none"
-          stroke={color} strokeWidth={stroke} strokeLinecap="round"
-          strokeDasharray={circ} strokeDashoffset={off}
-          style={{ transition: "stroke-dashoffset 1s linear, stroke 300ms" }} />
-      </g>
-      <text x="50%" y="52%" textAnchor="middle" dominantBaseline="middle"
-        fontWeight="700" fontSize={size < 90 ? 20 : 25} fill="#111827">
-        {secondsLeft}s
-      </text>
-    </svg>
-  );
-}
+/* ── sub-components ── */
+import SessionHeader from "./runner/SessionHeader";
+import SessionSetupForm from "./runner/SessionSetupForm";
+import CountdownRing from "./runner/CountdownRing";
+import ZUPTGrid from "./runner/ZUPTGrid";
+import StampsTable from "./runner/StampsTable";
+import ActionBar from "./runner/ActionBar";
+import StatusDialogs from "./runner/StatusDialogs";
 
-/* ───────── helpers ───────── */
-const TZ_LIST = ["UTC", "EST", "CST", "MST", "PDT", "GMT", "CET", "IST", "JST"];
-const TZ_IANA = {
-  UTC: "UTC", EST: "America/New_York", CST: "America/Chicago", MST: "America/Denver",
-  PDT: "America/Los_Angeles", GMT: "Etc/GMT", CET: "Europe/Paris",
-  IST: "Asia/Kolkata", JST: "Asia/Tokyo"
-};
-const clockStr = z =>
-  new Date().toLocaleTimeString("en-US", { timeZone: TZ_IANA[z], hour12: false });
-const chipTone = i => ["default", "success", "info", "warning", "secondary", "primary", "error"][(i + 1) % 7];
+/* ── helpers ── */
+import {
+  TZ_IANA, clockStr,
+  PLANS_CACHE_KEY,
+  loadOutbox, saveOutbox,
+  loadIndex, saveIndex,
+  loadStamps, saveStamps,
+  loadProcessed, saveProcessed,
+  pushReplace, pushCreateOnce,
+  groupAndCoalesce,
+  toDateSafe, toMillis, toTimestamp,
+  rehydrateTimestampsInPayload,
+  deriveLoopState,
+} from "../services/runnerHelpers";
 
-const PLANS_CACHE_KEY = "plansCache_v1";
-const OUTBOX_KEY = "sessionOutbox_v1";
-const INDEX_KEY = "sessionIndex_v1";
-const STAMPS_KEY_PREFIX = "stamps_";
-
-/* local storage helpers */
-const loadOutbox = () => { try { return JSON.parse(localStorage.getItem(OUTBOX_KEY) || "[]"); } catch { return []; } };
-const saveOutbox = (ops) => { try { localStorage.setItem(OUTBOX_KEY, JSON.stringify(ops)); } catch {} };
-
-const loadIndex = () => { try { return JSON.parse(localStorage.getItem(INDEX_KEY) || "{}"); } catch { return {}; } };
-const saveIndex = (idx) => { try { localStorage.setItem(INDEX_KEY, JSON.stringify(idx)); } catch {} };
-
-const stampsKey = (sid) => `${STAMPS_KEY_PREFIX}${sid}`;
-const loadStamps = (sid) => {
-  try {
-    const raw = localStorage.getItem(stampsKey(sid));
-    if (!raw) return [];
-    const arr = JSON.parse(raw);
-    return arr.map(t => ({ ...t, time: new Date(t.time) }));
-  } catch { return []; }
-};
-const saveStamps = (sid, list) => {
-  try {
-    localStorage.setItem(
-      stampsKey(sid),
-      JSON.stringify(list.map(t => ({ ...t, time: t.time.toISOString() })))
-    );
-  } catch {}
-};
-
-/* ───────── Outbox idempotency helpers (DEDUPING) ───────── */
-// Track which opIds have already been applied (survives reloads).
-const OP_TRACK_KEY = "outboxProcessed_v1"; // Set<string>
-const loadProcessed = () => {
-  try { return new Set(JSON.parse(localStorage.getItem(OP_TRACK_KEY) || "[]")); }
-  catch { return new Set(); }
-};
-const saveProcessed = (set) => {
-  try { localStorage.setItem(OP_TRACK_KEY, JSON.stringify([...set])); } catch {}
-};
-const genOpId = () => `op_${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
-
-/** Replace prior ops of the same type for this session, then push. (adds opId) */
-const pushReplace = (sessionId, type, payload) => {
-  const ops = loadOutbox();
-  const next = ops.filter(o => !(o.sessionId === sessionId && o.type === type));
-  next.push({ opId: genOpId(), type, sessionId, payload });
-  saveOutbox(next);
-};
-
-/** Guard against adding more than one CREATE for the same local session. (adds opId) */
-const pushCreateOnce = (sessionId, payload) => {
-  const ops = loadOutbox();
-  if (!ops.some(o => o.type === "create" && o.sessionId === sessionId)) {
-    ops.push({ opId: genOpId(), type: "create", sessionId, payload });
-    saveOutbox(ops);
-  }
-};
-
-/** Merge ops per session: keep first create, last update, last finish. */
-const groupAndCoalesce = (ops) => {
-  const bySession = new Map();
-  for (const op of ops) {
-    if (op.type === "touch") continue;
-    const g = bySession.get(op.sessionId) || { creates: [], updates: [], finishes: [] };
-    if (op.type === "create") g.creates.push(op);
-    else if (op.type === "update") g.updates.push(op);
-    else if (op.type === "finish") g.finishes.push(op);
-    bySession.set(op.sessionId, g);
-  }
-  const plan = [];
-  for (const [sessionId, g] of bySession.entries()) {
-    plan.push({
-      sessionId,
-      create: g.creates.length ? g.creates[0] : null,
-      update: g.updates.length ? g.updates[g.updates.length - 1] : null,
-      finish: g.finishes.length ? g.finishes[g.finishes.length - 1] : null,
-    });
-  }
-  return plan;
-};
-
-/* Safe conversions */
-const toDateSafe = (v) => {
-  if (!v) return new Date(0);
-  if (typeof v?.toDate === "function") return v.toDate(); // Firestore Timestamp
-  if (typeof v?.seconds === "number" && typeof v?.nanoseconds === "number") {
-    return new Date(v.seconds * 1000 + Math.floor(v.nanoseconds / 1e6));
-  }
-  if (v instanceof Date) return v;
-  if (typeof v === "number") return new Date(v);
-  return new Date(v); // ISO string
-};
-const toMillis = (v) => toDateSafe(v).getTime();
-const toTimestamp = (v) => Timestamp.fromDate(toDateSafe(v));
-
-/* Deep-rehydrate any {seconds,nanoseconds} or ms into Firestore Timestamps */
-const rehydrateTimestampsInPayload = (payload) => {
-  const out = { ...payload };
-  if ("startedAt" in out) out.startedAt = toTimestamp(out.startedAt);
-  if ("endedAt"   in out && out.endedAt) out.endedAt = toTimestamp(out.endedAt);
-  if (Array.isArray(out.timestamps)) {
-    out.timestamps = out.timestamps.map(t => ({
-      ...t,
-      time: toTimestamp(t.time)
-    }));
-  }
-  return out;
-};
-
-/* derive lap & captured */
-function deriveLoopState(stamps) {
-  const starts = [];
-  const stops = new Set();
-  const rexStart = /^L(\d+)\s+Start$/;
-  const rexStop = /^L(\d+)\s+Stop$/;
-
-  for (const s of stamps) {
-    const mS = rexStart.exec(s.zuptName);
-    const mE = rexStop.exec(s.zuptName);
-    if (mS) starts.push(parseInt(mS[1], 10));
-    if (mE) stops.add(parseInt(mE[1], 10));
-  }
-  if (!starts.length) return { loopIdx: 1, loopOn: false, captured: new Set() };
-  const maxStart = Math.max(...starts);
-  const loopOn = !stops.has(maxStart);
-  const loopIdx = loopOn ? maxStart : maxStart + 1;
-
-  const lastStartIdx = [...stamps].map(s => s.zuptName).lastIndexOf(`L${loopOn ? loopIdx : loopIdx - 1} Start`);
-  const captured = new Set();
-  for (let i = Math.max(0, lastStartIdx + 1); i < stamps.length; i++) {
-    const name = stamps[i].zuptName;
-    if (!rexStart.test(name) && !rexStop.test(name) && !name.startsWith("MANUAL:")) {
-      captured.add(name);
-    }
-  }
-
-  return { loopIdx, loopOn, captured };
-}
+/* ── keyboard shortcuts ── */
+import useKeyboardShortcuts from "../hooks/useKeyboardShortcuts";
 
 /* ───────── component ───────── */
-export default function PlanRunner() {
+export default function PlanRunner({ onSessionActive }) {
   const theme = useTheme();
   const isMobile = useMediaQuery(theme.breakpoints.down("sm"));
 
@@ -231,7 +65,6 @@ export default function PlanRunner() {
     return () => { window.removeEventListener("online", on); window.removeEventListener("offline", off); };
   }, []);
 
-  // Explicitly toggle Firestore network so the SDK doesn't keep trying while offline
   useEffect(() => {
     try { online ? enableNetwork(db) : disableNetwork(db); } catch {}
   }, [online]);
@@ -254,6 +87,7 @@ export default function PlanRunner() {
       return raw ? JSON.parse(raw) : [];
     } catch { return []; }
   });
+  const [plansLoading, setPlansLoading] = useState(true);
   const [planId, setPlanId] = useState("");
   const plan = useMemo(() => plans.find(p => p.id === planId), [plans, planId]);
 
@@ -277,6 +111,7 @@ export default function PlanRunner() {
         ));
         setUnfinishedFirebase(uSnap.docs.map(d => ({ id: d.id, ...d.data() })));
       } catch {}
+      setPlansLoading(false);
     })();
   }, [user]);
 
@@ -287,21 +122,28 @@ export default function PlanRunner() {
   const [elapsed, setElapsed] = useState(0);
   const [stamps, setStamps] = useState([]);
 
-  // plan snapshot for offline
-  const [sessionPlan, setSessionPlan] = useState(null); // {id,name,zupts}
+  const [sessionPlan, setSessionPlan] = useState(null);
   const activePlan = plan || sessionPlan;
 
-  // derived loop state
   const [{ loopIdx, loopOn }, setLoopMeta] = useState({ loopIdx: 1, loopOn: false });
   const [captured, setCaptured] = useState(new Set());
 
   /* compact status dialogs */
-  const [openPanel, setOpenPanel] = useState(null); // 'net'|'queued'|'finished'|null
+  const [openPanel, setOpenPanel] = useState(null);
 
-  /* 🔔 instant-update helpers (no page reloads) */
-  const [poke, setPoke] = useState(0);          // force re-render after outbox/index changes
+  /* finish confirmation + post-session summary */
+  const [finishConfirmOpen, setFinishConfirmOpen] = useState(false);
+  const [sessionSummary, setSessionSummary] = useState(null);
+
+  /* instant-update helpers */
+  const [poke, setPoke] = useState(0);
   const bump = () => setPoke(x => x + 1);
-  const [formKey, setFormKey] = useState(0);    // reset pre-start form after Finish
+  const [formKey, setFormKey] = useState(0);
+
+  /* notify parent when session becomes active / inactive */
+  useEffect(() => {
+    onSessionActive?.(!!startedAt);
+  }, [startedAt, onSessionActive]);
 
   useEffect(() => {
     if (!startedAt) return;
@@ -316,12 +158,32 @@ export default function PlanRunner() {
   }, [stamps]);
 
   /* countdown */
-  const [active, setActive] = useState(null); // {id,name,wait}
+  const [active, setActive] = useState(null);
   const [remain, setRemain] = useState(null);
   const timerRunning = remain !== null;
   useEffect(() => {
     if (remain === null) return;
-    if (remain === 0) { setActive(null); setRemain(null); return; }
+    if (remain === 0) {
+      // Haptic vibration (mobile)
+      try { if (navigator.vibrate) navigator.vibrate([200, 100, 200]); } catch {}
+      // Audio double-beep via Web Audio API
+      try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const beep = (freq, delay, dur) => {
+          const osc = ctx.createOscillator();
+          const gain = ctx.createGain();
+          osc.connect(gain); gain.connect(ctx.destination);
+          osc.frequency.value = freq;
+          gain.gain.value = 0.3;
+          osc.start(ctx.currentTime + delay);
+          osc.stop(ctx.currentTime + delay + dur);
+        };
+        beep(880, 0, 0.15);
+        beep(1100, 0.25, 0.2);
+      } catch {}
+      setActive(null); setRemain(null);
+      return;
+    }
     const id = setTimeout(() => setRemain(r => r - 1), 1000);
     return () => clearTimeout(id);
   }, [remain]);
@@ -350,7 +212,6 @@ export default function PlanRunner() {
     saveOutbox(ops);
   };
 
-  // LOCAL-FIRST: do not call Firestore when offline
   const store = async (list, msg) => {
     if (!sessionId) return;
     persistStampsLocal(sessionId, list);
@@ -359,7 +220,7 @@ export default function PlanRunner() {
       const payload = { timestamps: list.map(t => ({ ...t, time: toMillis(t.time) })) };
       pushReplace(sessionId, "update", payload);
       localQueueTouch();
-      bump();                   // 👈 refresh queued/badges instantly
+      bump();
       setSnack(msg);
       return;
     }
@@ -371,12 +232,12 @@ export default function PlanRunner() {
     } catch {
       const payload = { timestamps: list.map(t => ({ ...t, time: toMillis(t.time) })) };
       pushReplace(sessionId, "update", payload);
-      bump();                   // 👈
+      bump();
     }
     setSnack(msg);
   };
 
-  // Flush outbox when back online & prune finished-pending from index (IDEMPOTENT + opId)
+  /* Flush outbox when back online (IDEMPOTENT + opId) */
   useEffect(() => {
     if (!online || !user) return;
 
@@ -384,29 +245,24 @@ export default function PlanRunner() {
       const ops = loadOutbox();
       if (!ops.length) return;
 
-      // plan per session
-      const plan = groupAndCoalesce(ops);
-
-      // processed op-ids survive reloads; skip if seen
+      const flushPlan = groupAndCoalesce(ops);
       const processed = loadProcessed();
       const remember = (op) => { if (op?.opId) processed.add(op.opId); };
 
-      const idMap = new Map();     // localId -> remoteId
+      const idMap = new Map();
       const remaining = [];
 
-      for (const item of plan) {
+      for (const item of flushPlan) {
         const localId = item.sessionId;
         let targetId = idMap.get(localId) || localId;
 
         try {
-          // CREATE once
           if (item.create && !processed.has(item.create.opId)) {
             const payload = rehydrateTimestampsInPayload(item.create.payload);
             const ref = await addDoc(collection(db, "sessions"), payload);
             targetId = ref.id;
             idMap.set(localId, targetId);
 
-            // migrate index + stamps localId -> remoteId
             const idx = loadIndex();
             if (idx[localId]) {
               idx[targetId] = { ...idx[localId], id: targetId };
@@ -421,21 +277,18 @@ export default function PlanRunner() {
             targetId = idMap.get(localId) || localId;
           }
 
-          // UPDATE (last) — run if not already applied
           if (item.update && !processed.has(item.update.opId)) {
             const payload = rehydrateTimestampsInPayload(item.update.payload);
             await updateDoc(doc(db, "sessions", targetId), payload);
             remember(item.update);
           }
 
-          // FINISH (last)
           if (item.finish && !processed.has(item.finish.opId)) {
             const payload = rehydrateTimestampsInPayload(item.finish.payload);
             await updateDoc(doc(db, "sessions", targetId), payload);
             remember(item.finish);
           }
         } catch {
-          // keep raw ops for this local session for retry
           for (const o of ops) {
             if (o.type === "touch") continue;
             if (o.sessionId === localId) remaining.push(o);
@@ -443,12 +296,10 @@ export default function PlanRunner() {
         }
       }
 
-      // Persist processed opIds & remaining (drop 'touch')
       saveProcessed(processed);
       const filtered = remaining.filter(o => o.type !== "touch");
       saveOutbox(filtered);
 
-      // prune finished-pending with no pending ops
       const stillPendingIds = new Set(filtered.map(o => o.sessionId));
       const idx0 = loadIndex();
       let touched = false;
@@ -461,12 +312,13 @@ export default function PlanRunner() {
       if (touched) saveIndex(idx0);
 
       if (ops.length !== filtered.length) setSnack("Offline changes synced");
-      bump();   // 👈 reflect counts immediately
+      bump();
     };
 
     flush();
   }, [online, user]);
 
+  /* ───────── Actions ───────── */
   const addStamp = async (id, name, dur = 0) => {
     const now = new Date();
     const lastForLoc = [...stamps].reverse().find(s => s.zuptName === name);
@@ -478,7 +330,7 @@ export default function PlanRunner() {
     void store(upd, "Stamp saved");
   };
 
-  const undoLast = async () => {
+  const undoLast = useCallback(async () => {
     if (!stamps.length) return;
     if (!window.confirm("Undo last stamp?")) return;
     const rest = stamps.slice(0, -1);
@@ -487,9 +339,8 @@ export default function PlanRunner() {
     setCaptured(prev => { const s = new Set(prev); s.delete(stamps.at(-1).zuptName); return s; });
     persistStampsLocal(sessionId, rest);
     void store(rest, "Last stamp removed");
-  };
+  }, [stamps, sessionId]);
 
-  /* actions */
   const start = async () => {
     if (!activePlan || !title.trim() || !user) return;
     const ts = new Date();
@@ -501,74 +352,47 @@ export default function PlanRunner() {
     if (!online) {
       newId = `local:${Date.now()}`;
       const payload = {
-        uid: user.uid,
-        planId: snapshot.id,
-        planName: snapshot.name,
-        planSnapshot: snapshot,
-        sessionTitle: title.trim(),
-        timezone: tz,
-        startedAt: ts.getTime(),
-        timestamps: [],
-        endedAt: null,
-        startedOffline: true,
-        createdAt: Date.now()
+        uid: user.uid, planId: snapshot.id, planName: snapshot.name,
+        planSnapshot: snapshot, sessionTitle: title.trim(), timezone: tz,
+        startedAt: ts.getTime(), timestamps: [], endedAt: null,
+        startedOffline: true, createdAt: Date.now()
       };
       pushCreateOnce(newId, payload);
       localQueueTouch();
-      bump();                      // 👈 queued badge now
+      bump();
     } else {
       try {
         const ref = await addDoc(collection(db, "sessions"), {
-          uid: user.uid,
-          planId: snapshot.id,
-          planName: snapshot.name,
-          planSnapshot: snapshot,
-          sessionTitle: title.trim(),
-          timezone: tz,
-          startedAt: Timestamp.fromDate(ts),
-          timestamps: [],
-          endedAt: null,
-          startedOffline: false,
-          createdAt: Timestamp.fromDate(new Date())
+          uid: user.uid, planId: snapshot.id, planName: snapshot.name,
+          planSnapshot: snapshot, sessionTitle: title.trim(), timezone: tz,
+          startedAt: Timestamp.fromDate(ts), timestamps: [], endedAt: null,
+          startedOffline: false, createdAt: Timestamp.fromDate(new Date())
         });
         newId = ref.id;
       } catch {
         newId = `local:${Date.now()}`;
         offlineStart = true;
         const payload = {
-          uid: user.uid,
-          planId: snapshot.id,
-          planName: snapshot.name,
-          planSnapshot: snapshot,
-          sessionTitle: title.trim(),
-          timezone: tz,
-          startedAt: ts.getTime(),
-          timestamps: [],
-          endedAt: null,
-          startedOffline: true,
-          createdAt: Date.now()
+          uid: user.uid, planId: snapshot.id, planName: snapshot.name,
+          planSnapshot: snapshot, sessionTitle: title.trim(), timezone: tz,
+          startedAt: ts.getTime(), timestamps: [], endedAt: null,
+          startedOffline: true, createdAt: Date.now()
         };
         pushCreateOnce(newId, payload);
-        bump();                    // 👈
+        bump();
       }
     }
 
     const idx = loadIndex();
     idx[newId] = {
-      id: newId,
-      uid: user.uid,
-      title: title.trim(),
-      planId: snapshot.id,
-      planName: snapshot.name,
-      startedAt: ts.toISOString(),
-      startedOffline: offlineStart,
-      status: "active"
+      id: newId, uid: user.uid, title: title.trim(),
+      planId: snapshot.id, planName: snapshot.name,
+      startedAt: ts.toISOString(), startedOffline: offlineStart, status: "active"
     };
     saveIndex(idx);
     saveStamps(newId, []);
-    bump();                        // 👈 reflect “resume” list right away
+    bump();
 
-    // live UI
     setSessionId(newId);
     setStartedAt(ts);
     setLoopMeta({ loopIdx: 1, loopOn: false });
@@ -579,8 +403,6 @@ export default function PlanRunner() {
     setSnack(offlineStart ? "Session started (offline)" : "Session started");
 
     try { sessionStorage.setItem("activeSessionId", newId); } catch {}
-
-    // No reload: if offline, reveal the queued panel so it’s obvious
     if (offlineStart) setOpenPanel("queued");
   };
 
@@ -601,8 +423,7 @@ export default function PlanRunner() {
       const meta = idx[sid];
       if (meta) {
         setSessionPlan({
-          id: meta.planId,
-          name: meta.planName,
+          id: meta.planId, name: meta.planName,
           zupts: (plans.find(p => p.id === meta.planId)?.zupts) || (s.planSnapshot?.zupts) || []
         });
         setStartedOffline(!!meta.startedOffline);
@@ -622,30 +443,30 @@ export default function PlanRunner() {
     setSnack("Session resumed");
   };
 
-  const toggleLoop = async () => {
+  const toggleLoop = useCallback(async () => {
     if (!loopOn) {
       await addStamp(null, `L${loopIdx} Start`);
     } else {
       await addStamp(null, `L${loopIdx} Stop`);
       setActive(null); setRemain(null);
     }
-  };
+  }, [loopOn, loopIdx, stamps, sessionId]);
 
-  const clickZ = async (z) => {
+  const clickZ = useCallback(async (z) => {
     if (captured.has(z.name) || timerRunning) return;
     if (!loopOn) { setSnack("Needs to Record Lap"); return; }
     setCaptured(prev => new Set(prev).add(z.name));
     setActive(z);
     setRemain(z.wait || 0);
     void addStamp(z.id, z.name, z.wait || 0);
-  };
+  }, [captured, timerRunning, loopOn, stamps, sessionId]);
 
-  const manual = async () => {
+  const manual = useCallback(async () => {
     const note = prompt("Note for manual timestamp:");
     if (note) void addStamp(null, `MANUAL: ${note}`);
-  };
+  }, [stamps, sessionId]);
 
-  const finish = async () => {
+  const finish = useCallback(async () => {
     if (!sessionId) return;
     const payloadOffline = { endedAt: Date.now() };
     let queued = !online;
@@ -653,14 +474,14 @@ export default function PlanRunner() {
     if (!online) {
       pushReplace(sessionId, "finish", payloadOffline);
       localQueueTouch();
-      bump();                    // 👈
+      bump();
     } else {
       try {
         await updateDoc(doc(db, "sessions", sessionId), { endedAt: Timestamp.fromDate(new Date()) });
       } catch {
         queued = true;
         pushReplace(sessionId, "finish", payloadOffline);
-        bump();                  // 👈
+        bump();
       }
     }
 
@@ -671,11 +492,24 @@ export default function PlanRunner() {
     } else {
       if (idx[sessionId]) { delete idx[sessionId]; saveIndex(idx); }
     }
-    bump();                      // 👈 update pending badge immediately
+    bump();
 
     try { sessionStorage.removeItem("activeSessionId"); } catch {}
 
-    // Clear live UI (what old reload did)
+    // Capture summary before resetting state
+    setSessionSummary({
+      title,
+      planName: activePlan?.name || "",
+      stampCount: stamps.length,
+      zuptsCaptured: captured.size,
+      zuptsTotal: activePlan?.zupts?.length || 0,
+      elapsed: lap,
+      startedAt,
+      endedAt: new Date(),
+      queued,
+    });
+
+    setFinishConfirmOpen(false);
     setSessionId(null);
     setStartedAt(null);
     setLoopMeta({ loopIdx: 1, loopOn: false });
@@ -685,16 +519,31 @@ export default function PlanRunner() {
     setSessionPlan(null);
     setStartedOffline(false);
 
-    // Reset pre-start form (and kill autofill ghosts)
     setTitle("");
     setPlanId("");
     setFormKey(k => k + 1);
 
-    setSnack(queued ? "Session finalized (will upload when online)" : "Session finalized");
-
-    // No reload: show finished panel when offline
     if (queued) setOpenPanel("finished");
-  };
+  }, [sessionId, online, title, activePlan, stamps, captured, lap, startedAt]);
+
+  /* Keyboard shortcut: click ZUPT by visible index (respects reverse order) */
+  const clickZuptByIndex = useCallback((idx) => {
+    if (!activePlan?.zupts?.length) return;
+    const ordered = reverse ? [...activePlan.zupts].reverse() : activePlan.zupts;
+    if (idx >= 0 && idx < ordered.length) {
+      clickZ(ordered[idx]);
+    }
+  }, [activePlan, reverse, clickZ]);
+
+  /* ── keyboard shortcuts ── */
+  useKeyboardShortcuts({
+    enabled: !!startedAt,
+    onToggleLap: toggleLoop,
+    onClickZuptByIndex: clickZuptByIndex,
+    onUndoLast: undoLast,
+    onManual: manual,
+    onFinish: () => setFinishConfirmOpen(true),
+  });
 
   /* Auto-resume session from hint — OFFLINE ONLY */
   useEffect(() => {
@@ -709,7 +558,7 @@ export default function PlanRunner() {
     } catch {}
   }, [user, startedAt, online]);
 
-  /* derived UI lists/counters (recompute on every render; backed by localStorage) */
+  /* derived UI lists/counters */
   const outbox = !online ? loadOutbox() : [];
   const queuedCount = outbox.filter(o => o.type !== "touch").length;
   const userUid = user?.uid;
@@ -727,475 +576,380 @@ export default function PlanRunner() {
     ...(unfinishedFirebase || []),
     ...localActives.filter(l => !(unfinishedFirebase || []).some(f => f.id === l.id))
   ];
+
+  /* ───────── RENDER ───────── */
   return (
     <Box sx={{ maxWidth: isMobile ? "100%" : 900, mx: "auto", px: isMobile ? 1 : 2, pt: 2, pb: 8 }}>
-      {/* ───────────────── Header / Clock / Status ───────────────── */}
-      <Paper
-        elevation={6}
-        sx={{
-          p: isMobile ? 2 : 3,
-          mb: isMobile ? 3 : 4,
-          borderRadius: 3,
-          color: "#fff",
-          textAlign: "center",
-          bgcolor: "transparent",
-          background:
-            "radial-gradient(110% 140% at 0% 0%, rgba(99,102,241,1) 0%, rgba(79,70,229,1) 55%, rgba(67,56,202,1) 100%)",
-          boxShadow:
-            "0 10px 30px rgba(79,70,229,.35), inset 0 0 0 1px rgba(255,255,255,0.06)",
-        }}
-      >
-        <Typography
-          variant={isMobile ? "h5" : "h4"}
-          fontWeight={800}
-          letterSpacing={0.2}
-          sx={{ textShadow: "0 1px 10px rgba(0,0,0,.18)" }}
-        >
-          {clock}
-        </Typography>
 
-        {startedAt && startedOffline && (
-          <Tooltip title="This session was started while offline">
-            <Chip
-              size="small"
-              color="warning"
-              variant="filled"
-              icon={<OfflineBoltIcon />}
-              label="Started offline"
-              sx={{
-                mt: 1,
-                color: "#111",
-                fontWeight: 600,
-                bgcolor: "rgba(255,214,102,.95)",
-                "& .MuiChip-icon": { color: "#111" },
-              }}
-            />
-          </Tooltip>
-        )}
+      {/* Header / Clock / Offline Status */}
+      <SessionHeader
+        clock={clock}
+        tz={tz}
+        setTz={setTz}
+        startedAt={startedAt}
+        startedOffline={startedOffline}
+        isMobile={isMobile}
+        online={online}
+        queuedCount={queuedCount}
+        finishedCount={finishedCount}
+        onOpenPanel={setOpenPanel}
+      />
 
-        <Box sx={{ display: "flex", justifyContent: "center" }}>
-          <TextField
-            select
-            size="small"
-            value={tz}
-            onChange={(e) => setTz(e.target.value)}
-            sx={{
-              mt: 1.25,
-              width: 140,
-              ".MuiOutlinedInput-root": {
-                bgcolor: "rgba(255,255,255,0.12)",
-                color: "#fff",
-                borderRadius: 2,
-                "& fieldset": { borderColor: "rgba(255,255,255,0.18)" },
-                "&:hover fieldset": { borderColor: "rgba(255,255,255,0.35)" },
-              },
-              ".MuiSvgIcon-root": { color: "#fff" },
-            }}
-          >
-            {TZ_LIST.map((t) => (
-              <MenuItem key={t} value={t}>
-                {t}
-              </MenuItem>
-            ))}
-          </TextField>
-        </Box>
-
-        {/* compact status row — render ONLY when offline */}
-        {!online && (
-          <Stack
-            direction="row"
-            spacing={1.5}
-            justifyContent="center"
-            alignItems="center"
-            sx={{ mt: 1.25 }}
-          >
-            <Tooltip title="Offline — network unavailable">
-              <span>
-                <IconButton
-                  size="small"
-                  onClick={() => setOpenPanel("net")}
-                  aria-label="Network status"
-                  sx={{
-                    color: "warning.light",
-                    bgcolor: "rgba(0,0,0,.18)",
-                    "&:hover": { bgcolor: "rgba(0,0,0,.26)" },
-                  }}
-                >
-                  <CloudOffIcon fontSize="small" />
-                </IconButton>
-              </span>
-            </Tooltip>
-
-            <Tooltip
-              title={
-                queuedCount
-                  ? `${queuedCount} change${queuedCount > 1 ? "s" : ""} queued`
-                  : "No queued changes"
-              }
-            >
-              <span>
-                <Badge
-                  badgeContent={queuedCount || 0}
-                  color={queuedCount ? "info" : "default"}
-                  overlap="circular"
-                >
-                  <IconButton
-                    size="small"
-                    onClick={() => setOpenPanel("queued")}
-                    aria-label="Queued changes"
-                    sx={{
-                      color: queuedCount ? "info.light" : "rgba(255,255,255,.7)",
-                      bgcolor: "rgba(0,0,0,.18)",
-                      "&:hover": { bgcolor: "rgba(0,0,0,.26)" },
-                    }}
-                  >
-                    <CloudUploadIcon fontSize="small" />
-                  </IconButton>
-                </Badge>
-              </span>
-            </Tooltip>
-
-            <Tooltip
-              title={
-                finishedCount
-                  ? `${finishedCount} finished session${
-                      finishedCount > 1 ? "s" : ""
-                    } pending`
-                  : "Nothing pending"
-              }
-            >
-              <span>
-                <Badge
-                  badgeContent={finishedCount || 0}
-                  color={finishedCount ? "warning" : "default"}
-                  overlap="circular"
-                >
-                  <IconButton
-                    size="small"
-                    onClick={() => setOpenPanel("finished")}
-                    aria-label="Finished pending"
-                    sx={{
-                      color: finishedCount ? "warning.light" : "rgba(255,255,255,.7)",
-                      bgcolor: "rgba(0,0,0,.18)",
-                      "&:hover": { bgcolor: "rgba(0,0,0,.26)" },
-                    }}
-                  >
-                    <AssignmentTurnedInIcon fontSize="small" />
-                  </IconButton>
-                </Badge>
-              </span>
-            </Tooltip>
-          </Stack>
-        )}
-      </Paper>
-
-      <Typography variant="h6" gutterBottom sx={{ fontWeight: 700, letterSpacing: 0.2 }}>
+      <Typography variant="subtitle1" gutterBottom sx={{ fontWeight: 700, letterSpacing: 0.2, color: "text.secondary" }}>
         Run a Plan Session
       </Typography>
 
-      {/* ───────────────── Resume (when nothing started) ───────────────── */}
-      {!startedAt && unfinished.length > 0 && (
-        <Box mb={3}>
-          <Typography variant="subtitle2" sx={{ fontWeight: 600, mb: 1 }}>
-            Resume unfinished:
-          </Typography>
-          {unfinished.map((s) => (
-            <Button
-              key={s.id}
-              variant="outlined"
-              size={isMobile ? "small" : "medium"}
-              sx={{ mr: 1, mb: 1 }}
-              onClick={() => resume(s)}
-            >
-              ▶ {s.sessionTitle || s.title || s.planName}
-              {s.local ? " (local)" : s.startedOffline ? " (offline)" : ""}
-            </Button>
-          ))}
-          <Divider sx={{ my: 2 }} />
-        </Box>
-      )}
-
-      {/* ───────────────── First-time form ───────────────── */}
+      {/* Pre-start form (when nothing running) */}
       {!startedAt && (
-        <Box key={formKey}>
-          <TextField
-            select
-            fullWidth
-            label="Select Plan"
-            sx={{ mb: 2 }}
-            value={planId}
-            onChange={(e) => setPlanId(e.target.value)}
-          >
-            {plans.map((p) => (
-              <MenuItem key={p.id} value={p.id}>
-                {p.name}
-              </MenuItem>
-            ))}
-          </TextField>
-          <TextField
-            fullWidth
-            label="Session Title"
-            sx={{ mb: 2 }}
-            value={title}
-            onChange={(e) => setTitle(e.target.value)}
-          />
-          <Button
-            fullWidth
-            variant="contained"
-            size={isMobile ? "large" : "medium"}
-            startIcon={<PlayArrowIcon />}
-            disabled={!planId || !title.trim()}
-            onClick={start}
-          >
-            Start Session
-          </Button>
-        </Box>
+        <SessionSetupForm
+          plans={plans}
+          planId={planId}
+          setPlanId={setPlanId}
+          title={title}
+          setTitle={setTitle}
+          isMobile={isMobile}
+          onStart={start}
+          unfinished={unfinished}
+          onResume={resume}
+          formKey={formKey}
+          isLoading={plansLoading && !plans.length}
+        />
       )}
 
-      {/* ───────────────── Live mode ───────────────── */}
+      {/* ───────── Live mode ───────── */}
       {startedAt && activePlan && (
         <>
-          {/* Session meta (title / plan / started) */}
-          <Stack
-            direction="row"
-            alignItems="center"
-            spacing={1}
-            sx={{ mt: 0.5, mb: 1, flexWrap: "wrap" }}
+          {/* ── Session info card ── */}
+          <Box
+            sx={{
+              mt: 0.5,
+              mb: 1.5,
+              p: 1.5,
+              borderRadius: 2,
+              bgcolor: (t) =>
+                t.palette.mode === "dark"
+                  ? "rgba(99,102,241,0.08)"
+                  : "rgba(99,102,241,0.04)",
+              border: "1px solid",
+              borderColor: (t) =>
+                t.palette.mode === "dark"
+                  ? "rgba(99,102,241,0.18)"
+                  : "rgba(99,102,241,0.12)",
+            }}
           >
-            <Chip
-              size="small"
-              label={title || "(untitled)"}
-              sx={{
-                bgcolor: "rgba(99,102,241,0.10)",
-                border: "1px solid rgba(99,102,241,0.35)",
-                color: "text.primary",
-                fontWeight: 500,
-              }}
-            />
-            {activePlan?.name && (
-              <Chip
-                size="small"
-                label={activePlan.name}
-                sx={{
-                  bgcolor: "rgba(99,102,241,0.10)",
-                  border: "1px solid rgba(99,102,241,0.35)",
-                  color: "text.primary",
-                  fontWeight: 500,
-                }}
-              />
-            )}
-            <Chip
-              size="small"
-              label={`${toDateSafe(startedAt).toLocaleDateString(undefined, {
-                month: "short",
-                day: "numeric",
-                hour: "2-digit",
-                minute: "2-digit",
-              })}`}
-              sx={{
-                bgcolor: "rgba(99,102,241,0.10)",
-                border: "1px solid rgba(99,102,241,0.35)",
-                color: "text.primary",
-                fontWeight: 500,
-              }}
-            />
-          </Stack>
-
-          {/* Elapsed / Lap strip */}
-          <Stack
-            direction="row"
-            alignItems="center"
-            justifyContent="space-between"
-            sx={{ mb: isMobile ? 1 : 2 }}
-          >
-            <Stack direction="row" alignItems="center" spacing={1}>
-              <TimerIcon fontSize="small" sx={{ color: "primary.main" }} />
-              <Typography variant="subtitle1" sx={{ fontWeight: 600 }}>
-                Elapsed: <strong>{lap}</strong>
+            {/* Title + plan + date row */}
+            <Stack direction="row" alignItems="center" spacing={0.75} sx={{ mb: 1, flexWrap: "wrap" }}>
+              <Typography
+                variant="subtitle2"
+                sx={{ fontWeight: 700, color: "text.primary" }}
+              >
+                {title || "(untitled)"}
               </Typography>
-            </Stack>
-
-            <Stack direction="row" alignItems="center" spacing={1}>
-              <LocationIcon
-                fontSize="small"
-                sx={{ color: loopOn ? "error.main" : "text.secondary" }}
-              />
-              <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>
-                Current Lap: <strong>L{loopOn ? loopIdx : Math.max(1, loopIdx - 1)}</strong>{" "}
+              {activePlan?.name && (
                 <Typography
-                  component="span"
                   variant="caption"
-                  sx={{ ml: 0.5, color: "text.secondary" }}
+                  sx={{
+                    color: "text.secondary",
+                    fontWeight: 500,
+                    px: 0.75,
+                    py: 0.15,
+                    borderRadius: 1,
+                    bgcolor: (t) =>
+                      t.palette.mode === "dark"
+                        ? "rgba(255,255,255,0.06)"
+                        : "rgba(0,0,0,0.05)",
+                  }}
                 >
-                  {loopOn ? "(running)" : ""}
+                  {activePlan.name}
                 </Typography>
+              )}
+              <Typography variant="caption" sx={{ color: "text.secondary", ml: "auto" }}>
+                {toDateSafe(startedAt).toLocaleTimeString(undefined, {
+                  hour: "2-digit",
+                  minute: "2-digit",
+                })}
               </Typography>
             </Stack>
-          </Stack>
 
-          {/* Active ZUPT countdown */}
+            {/* Elapsed + Lap stat row */}
+            <Stack direction="row" spacing={1.5}>
+              <Box
+                sx={{
+                  flex: 1,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 0.75,
+                  p: 0.75,
+                  borderRadius: 1.5,
+                  bgcolor: (t) =>
+                    t.palette.mode === "dark"
+                      ? "rgba(99,102,241,0.12)"
+                      : "rgba(99,102,241,0.06)",
+                }}
+              >
+                <TimerIcon sx={{ fontSize: 18, color: "primary.main" }} />
+                <Box>
+                  <Typography variant="caption" sx={{ color: "text.secondary", lineHeight: 1, display: "block" }}>
+                    Elapsed
+                  </Typography>
+                  <Typography variant="subtitle2" sx={{ fontWeight: 700, lineHeight: 1.2 }}>
+                    {lap}
+                  </Typography>
+                </Box>
+              </Box>
+
+              <Box
+                sx={{
+                  flex: 1,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 0.75,
+                  p: 0.75,
+                  borderRadius: 1.5,
+                  bgcolor: (t) =>
+                    t.palette.mode === "dark"
+                      ? loopOn ? "rgba(239,68,68,0.12)" : "rgba(255,255,255,0.04)"
+                      : loopOn ? "rgba(239,68,68,0.06)" : "rgba(0,0,0,0.03)",
+                }}
+              >
+                <LocationIcon sx={{ fontSize: 18, color: loopOn ? "error.main" : "text.secondary" }} />
+                <Box>
+                  <Typography variant="caption" sx={{ color: "text.secondary", lineHeight: 1, display: "block" }}>
+                    Current Lap
+                  </Typography>
+                  <Typography variant="subtitle2" sx={{ fontWeight: 700, lineHeight: 1.2 }}>
+                    L{loopOn ? loopIdx : Math.max(1, loopIdx - 1)}
+                    {loopOn && (
+                      <Typography
+                        component="span"
+                        variant="caption"
+                        sx={{ ml: 0.5, color: "error.main", fontWeight: 600 }}
+                      >
+                        REC
+                      </Typography>
+                    )}
+                  </Typography>
+                </Box>
+              </Box>
+            </Stack>
+          </Box>
+
+          {/* ── Active ZUPT countdown ── */}
           {active && (
-            <Box textAlign="center" mb={2}>
+            <Box
+              sx={{
+                display: "flex",
+                flexDirection: "column",
+                alignItems: "center",
+                mb: 2,
+                py: 2,
+                px: 1,
+                borderRadius: 3,
+                bgcolor: (t) =>
+                  t.palette.mode === "dark"
+                    ? "rgba(0,0,0,0.2)"
+                    : "rgba(0,0,0,0.02)",
+                border: "1px solid",
+                borderColor: "divider",
+              }}
+            >
               <CountdownRing
                 secondsLeft={remain}
                 total={active.wait || 0}
-                size={isMobile ? 80 : 130}
-                stroke={isMobile ? 6 : 8}
+                size={isMobile ? 100 : 130}
+                stroke={isMobile ? 7 : 9}
               />
               <Typography
-                variant="h6"
+                variant="subtitle2"
                 sx={{
                   mt: 1,
+                  fontWeight: 700,
+                  color: "primary.main",
+                  textAlign: "center",
                   display: "flex",
-                  justifyContent: "center",
                   alignItems: "center",
-                  gap: 1,
+                  gap: 0.5,
                 }}
               >
-                <LocationIcon fontSize="small" /> {active.name}
-                <IconButton
-                  onClick={undoLast}
-                  size={isMobile ? "small" : "medium"}
-                  sx={{ color: "error.main", ml: 0.5 }}
-                >
-                  <UndoIcon />
-                </IconButton>
+                <LocationIcon sx={{ fontSize: 16 }} />
+                {active.name}
               </Typography>
+              <Button
+                onClick={undoLast}
+                size="small"
+                variant="text"
+                startIcon={<UndoIcon />}
+                sx={{
+                  mt: 0.5,
+                  color: "error.main",
+                  fontSize: 12,
+                  fontWeight: 600,
+                  textTransform: "none",
+                  "&:hover": {
+                    bgcolor: (t) =>
+                      t.palette.mode === "dark"
+                        ? "rgba(239,68,68,0.15)"
+                        : "rgba(239,68,68,0.08)",
+                  },
+                }}
+              >
+                Undo
+              </Button>
             </Box>
           )}
 
           <Divider sx={{ my: 2 }} />
 
           {/* ZUPT chips */}
-          <Box sx={{ display: "flex", alignItems: "center", mb: 1 }}>
-            <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>
-              Select ZUPT location:
-            </Typography>
-            <IconButton
-              size="small"
-              sx={{ ml: 0.5 }}
-              onClick={() => setReverse((p) => !p)}
-              title="Flip order"
-            >
-              <SwapVertIcon fontSize="inherit" sx={{ transform: "rotate(90deg)" }} />
-            </IconButton>
-          </Box>
-
-          <Box sx={{ display: "flex", gap: 1, overflowX: "auto", py: 1 }}>
-            {(reverse ? [...(activePlan.zupts || [])].reverse() : activePlan.zupts || []).map(
-              (z, i) => {
-                const done = captured.has(z.name);
-                const disabled = timerRunning || done;
-                return (
-                  <Chip
-                    key={z.id || z.name}
-                    label={z.name}
-                    icon={done ? <CheckIcon /> : <TimerIcon />}
-                    color={done ? chipTone(i) : "default"}
-                    variant={done ? "filled" : "outlined"}
-                    clickable={!disabled}
-                    onClick={!disabled ? () => clickZ(z) : undefined}
-                  />
-                );
-              }
-            )}
-          </Box>
+          <ZUPTGrid
+            zupts={activePlan.zupts || []}
+            captured={captured}
+            timerRunning={timerRunning}
+            reverse={reverse}
+            setReverse={setReverse}
+            onClickZupt={clickZ}
+          />
 
           {/* Stamps table */}
-          {!!stamps.length && (
-            <Box mt={4} mb={12}>
-              <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>
-                Recorded timestamps:
-              </Typography>
-              <TableContainer
-                component={Paper}
-                variant="outlined"
-                sx={{ maxHeight: 240, mb: 2, pb: 8 }}
-              >
-                <Table size="small" stickyHeader>
-                  <TableHead>
-                    <TableRow>
-                      <TableCell>Name</TableCell>
-                      <TableCell>Time&nbsp;({tz})</TableCell>
-                      <TableCell>Dur&nbsp;(s)</TableCell>
-                    </TableRow>
-                  </TableHead>
-                  <TableBody>
-                    {stamps.map((t, i) => (
-                      <TableRow key={i}>
-                        <TableCell>{t.zuptName}</TableCell>
-                        <TableCell>{fmt(toDateSafe(t.time))}</TableCell>
-                        <TableCell>{t.duration}</TableCell>
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
-              </TableContainer>
-            </Box>
-          )}
+          <StampsTable stamps={stamps} tz={tz} />
         </>
       )}
 
-      {/* ───────────────── Sticky Action Bar ───────────────── */}
+      {/* Sticky Action Bar */}
       {startedAt && (
-        <Paper
-          elevation={6}
-          sx={{
-            position: "fixed",
-            bottom: 20,
-            left: "50%",
-            transform: "translateX(-50%)",
-            width: isMobile ? "calc(100% - 16px)" : "min(640px,90%)",
-            p: isMobile ? 1.2 : 2,
-            borderRadius: 4,
-            backgroundColor: "rgba(255,255,255,0.15)",
-            border: "1px solid rgba(255,255,255,0.25)",
-            backdropFilter: "blur(5px)",
-            WebkitBackdropFilter: "blur(5px)",
-            zIndex: theme.zIndex.drawer + 2,
-          }}
-        >
-          <Stack direction="row" spacing={isMobile ? 1 : 2} justifyContent="center" flexWrap="wrap">
-            <Button
-              fullWidth={isMobile}
-              sx={{ flex: isMobile ? 1 : undefined, py: 1.5 }}
-              variant="contained"
-              color={loopOn ? "error" : "primary"}
-              startIcon={loopOn ? <StopIcon /> : <LocationIcon />}
-              onClick={toggleLoop}
-              size={isMobile ? "small" : "medium"}
-            >
-              {loopOn ? `Stop L${loopIdx}` : `Record L${loopIdx}`}
-            </Button>
-
-            <Button
-              fullWidth={isMobile}
-              sx={{ flex: isMobile ? 1 : undefined }}
-              variant="outlined"
-              startIcon={<AddIcon />}
-              onClick={manual}
-              disabled={timerRunning}
-              size={isMobile ? "small" : "medium"}
-            >
-              Manual
-            </Button>
-
-            <Button
-              fullWidth={isMobile}
-              sx={{ flex: isMobile ? 1 : undefined }}
-              variant="contained"
-              color="success"
-              startIcon={<DoneAllIcon />}
-              onClick={finish}
-              size={isMobile ? "small" : "medium"}
-            >
-              Finish
-            </Button>
-          </Stack>
-        </Paper>
+        <ActionBar
+          loopOn={loopOn}
+          loopIdx={loopIdx}
+          isMobile={isMobile}
+          timerRunning={timerRunning}
+          onToggleLoop={toggleLoop}
+          onManual={manual}
+          onFinish={() => setFinishConfirmOpen(true)}
+        />
       )}
 
-      {/* ───────────────── Snackbars & Dialogs ───────────────── */}
+      {/* ── Finish Confirmation Dialog ── */}
+      <Dialog
+        open={finishConfirmOpen}
+        onClose={() => setFinishConfirmOpen(false)}
+        maxWidth="xs" fullWidth
+        PaperProps={{ sx: { borderRadius: 3 } }}
+      >
+        <DialogTitle sx={{ fontWeight: 700 }}>Finish Session?</DialogTitle>
+        <DialogContent dividers>
+          <Stack spacing={1.5}>
+            <Typography variant="body2"><strong>Title:</strong> {title || "(untitled)"}</Typography>
+            <Typography variant="body2"><strong>Plan:</strong> {activePlan?.name}</Typography>
+            <Typography variant="body2"><strong>Stamps recorded:</strong> {stamps.length}</Typography>
+            <Typography variant="body2">
+              <strong>ZUPTs captured:</strong> {captured.size} / {activePlan?.zupts?.length || 0}
+            </Typography>
+            <Typography variant="body2"><strong>Elapsed:</strong> {lap}</Typography>
+          </Stack>
+        </DialogContent>
+        <DialogActions sx={{ px: 3, py: 2 }}>
+          <Button onClick={() => setFinishConfirmOpen(false)} sx={{ textTransform: "none" }}>
+            Cancel
+          </Button>
+          <Button
+            variant="contained" color="success"
+            onClick={finish}
+            sx={{ textTransform: "none", fontWeight: 700 }}
+          >
+            Finish Session
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* ── Post-Session Summary Dialog ── */}
+      <Dialog
+        open={!!sessionSummary}
+        onClose={() => setSessionSummary(null)}
+        maxWidth="xs" fullWidth
+        PaperProps={{ sx: { borderRadius: 3 } }}
+      >
+        <DialogTitle sx={{ display: "flex", alignItems: "center", gap: 1, fontWeight: 700 }}>
+          <CheckCircleOutlineIcon color="success" />
+          Session Complete
+        </DialogTitle>
+        <DialogContent dividers>
+          {sessionSummary && (
+            <Stack spacing={2}>
+              <Box>
+                <Typography variant="h6" fontWeight={700} color="text.primary">{sessionSummary.title}</Typography>
+                <Typography variant="body2" sx={{ color: (t) => t.palette.mode === "dark" ? "grey.400" : "text.secondary" }}>
+                  {sessionSummary.planName}
+                </Typography>
+              </Box>
+
+              <Stack direction="row" spacing={2} flexWrap="wrap" useFlexGap>
+                <Box sx={{ textAlign: "center", flex: 1, p: 1.5, borderRadius: 2, bgcolor: "action.hover" }}>
+                  <Typography variant="h5" fontWeight={800} color="primary.light">
+                    {sessionSummary.stampCount}
+                  </Typography>
+                  <Typography
+                    variant="caption"
+                    sx={{ color: (t) => t.palette.mode === "dark" ? "grey.300" : "text.secondary", fontWeight: 500 }}
+                  >
+                    Stamps
+                  </Typography>
+                </Box>
+                <Box sx={{ textAlign: "center", flex: 1, p: 1.5, borderRadius: 2, bgcolor: "action.hover" }}>
+                  <Typography variant="h5" fontWeight={800} color="primary.light">
+                    {sessionSummary.zuptsCaptured}/{sessionSummary.zuptsTotal}
+                  </Typography>
+                  <Typography
+                    variant="caption"
+                    sx={{ color: (t) => t.palette.mode === "dark" ? "grey.300" : "text.secondary", fontWeight: 500 }}
+                  >
+                    ZUPTs
+                  </Typography>
+                </Box>
+                <Box sx={{ textAlign: "center", flex: 1, p: 1.5, borderRadius: 2, bgcolor: "action.hover" }}>
+                  <Typography variant="h5" fontWeight={800} color="primary.light">
+                    {sessionSummary.elapsed}
+                  </Typography>
+                  <Typography
+                    variant="caption"
+                    sx={{ color: (t) => t.palette.mode === "dark" ? "grey.300" : "text.secondary", fontWeight: 500 }}
+                  >
+                    Duration
+                  </Typography>
+                </Box>
+              </Stack>
+
+              <Stack direction="row" alignItems="center" spacing={1} sx={{ py: 1 }}>
+                {sessionSummary.queued ? (
+                  <>
+                    <CloudUploadIcon color="warning" />
+                    <Typography variant="body2" color="warning.main" fontWeight={600}>
+                      Queued for upload (will sync when online)
+                    </Typography>
+                  </>
+                ) : (
+                  <>
+                    <CloudDoneIcon color="success" />
+                    <Typography variant="body2" color="success.main" fontWeight={600}>
+                      Synced to cloud
+                    </Typography>
+                  </>
+                )}
+              </Stack>
+            </Stack>
+          )}
+        </DialogContent>
+        <DialogActions sx={{ px: 3, py: 2 }}>
+          <Button
+            variant="contained"
+            onClick={() => setSessionSummary(null)}
+            sx={{ textTransform: "none", fontWeight: 700 }}
+          >
+            Done
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Snackbar */}
       <Snackbar
         open={!!snack}
         autoHideDuration={2400}
@@ -1207,47 +961,13 @@ export default function PlanRunner() {
         </Alert>
       </Snackbar>
 
-      {/* Compact Status Dialogs */}
-      <Dialog open={openPanel === "net"} onClose={() => setOpenPanel(null)} maxWidth="xs" fullWidth>
-        <DialogTitle>Network status</DialogTitle>
-        <DialogContent dividers>
-          <Typography variant="body2">
-            You’re offline because the network is unavailable. Actions are queued locally and will upload automatically when you’re
-            back online.
-          </Typography>
-        </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setOpenPanel(null)}>Close</Button>
-        </DialogActions>
-      </Dialog>
-
-      <Dialog open={openPanel === "queued"} onClose={() => setOpenPanel(null)} maxWidth="xs" fullWidth>
-        <DialogTitle>Queued changes</DialogTitle>
-        <DialogContent dividers>
-          <Typography variant="body2">
-            {queuedCount === 0
-              ? "No queued changes."
-              : `${queuedCount} change${queuedCount > 1 ? "s" : ""} will upload when you’re back online.`}
-          </Typography>
-        </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setOpenPanel(null)}>Close</Button>
-        </DialogActions>
-      </Dialog>
-
-      <Dialog open={openPanel === "finished"} onClose={() => setOpenPanel(null)} maxWidth="xs" fullWidth>
-        <DialogTitle>Finished (pending upload)</DialogTitle>
-        <DialogContent dividers>
-          <Typography variant="body2">
-            {finishedCount === 0
-              ? "No finished sessions pending."
-              : `${finishedCount} finished session${finishedCount > 1 ? "s are" : " is"} waiting to upload.`}
-          </Typography>
-        </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setOpenPanel(null)}>Close</Button>
-        </DialogActions>
-      </Dialog>
+      {/* Status Dialogs */}
+      <StatusDialogs
+        openPanel={openPanel}
+        onClose={() => setOpenPanel(null)}
+        queuedCount={queuedCount}
+        finishedCount={finishedCount}
+      />
     </Box>
   );
 }

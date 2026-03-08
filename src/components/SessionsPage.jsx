@@ -3,7 +3,7 @@
 // Shows tiny icons for "started offline" (⚡) and "merged", plus an info (i) icon
 // for which plan was used (tooltip). Also de-dupes identical sessions on load.
 
-import React, { useEffect, useState, useCallback } from "react";
+import React, { useEffect, useState, useCallback, lazy, Suspense } from "react";
 import {
   Box, Paper, Typography, CircularProgress, List, ListItem,
   ListItemText, Divider, IconButton, Stack, Tooltip, Dialog,
@@ -11,7 +11,8 @@ import {
   FormControl, InputLabel, Select, MenuItem, Slider, Button, Checkbox,
   ToggleButtonGroup, ToggleButton, TableContainer,
   Table, TableHead, TableRow, TableCell, TableBody, ListItemIcon,
-  useTheme, useMediaQuery, AppBar, Toolbar, TextField, Backdrop
+  useTheme, useMediaQuery, AppBar, Toolbar, TextField, Backdrop,
+  Skeleton
 } from "@mui/material";
 import VisibilityIcon        from "@mui/icons-material/Visibility";
 import DownloadIcon          from "@mui/icons-material/Download";
@@ -23,6 +24,11 @@ import EmailIcon             from "@mui/icons-material/Email";
 import CloseIcon             from "@mui/icons-material/Close";
 import OfflineBoltIcon       from "@mui/icons-material/OfflineBolt";
 import InfoOutlinedIcon      from "@mui/icons-material/InfoOutlined";
+import HistoryIcon           from "@mui/icons-material/History";
+import AccessTimeIcon        from "@mui/icons-material/AccessTime";
+import CalendarTodayIcon     from "@mui/icons-material/CalendarToday";
+import MapIcon               from "@mui/icons-material/Map";
+import TableChartIcon        from "@mui/icons-material/TableChart";
 
 import { db } from "../firebase";
 import {
@@ -30,6 +36,8 @@ import {
   getDoc, updateDoc, deleteDoc, addDoc, Timestamp
 } from "firebase/firestore";
 import { getAuth } from "firebase/auth";
+
+const SessionMapView = lazy(() => import("./SessionMapView"));
 
 /* ───────── safe date helpers ───────── */
 const toDateSafe = (v) => {
@@ -96,6 +104,7 @@ export default function SessionsPage() {
   const [basis,setBasis]     = useState("UTC");
   const [step,setStep]       = useState(0);
   const [view,setView]       = useState("ZUPT");
+  const [displayMode,setDisplayMode] = useState("table");
   const [snack,setSnack]     = useState("");
   const [selected,setSelected]= useState(new Set());
 
@@ -280,153 +289,191 @@ export default function SessionsPage() {
   /* ---------- loaders ---------- */
   if(loading){
     return (
-      <Backdrop open sx={{color:"#fff", zIndex:(t)=>t.zIndex.drawer+1}}>
-        <CircularProgress size={80}/>
-      </Backdrop>
+      <Box sx={{maxWidth:isMobile?"100%":900,mx:"auto",px:isMobile?1:2,pt:1,pb:6}}>
+        <Stack spacing={1.5}>
+          {[1,2,3,4].map(i => (
+            <Paper key={i} variant="outlined" sx={{ p: 0, overflow: "hidden" }}>
+              <Stack direction="row" alignItems="center" spacing={1.5} sx={{ p: 1.5 }}>
+                <Skeleton variant="rectangular" width={20} height={20} sx={{ borderRadius: 0.5 }} />
+                <Box sx={{ flex: 1 }}>
+                  <Skeleton variant="text" width="60%" height={22} />
+                  <Stack direction="row" spacing={1} mt={0.5}>
+                    <Skeleton variant="text" width={90} height={16} />
+                    <Skeleton variant="rounded" width={60} height={16} />
+                    <Skeleton variant="text" width={80} height={16} />
+                  </Stack>
+                </Box>
+                <Skeleton variant="circular" width={28} height={28} />
+                <Skeleton variant="circular" width={28} height={28} />
+              </Stack>
+            </Paper>
+          ))}
+        </Stack>
+      </Box>
     );
   }
-  if(!sessions.length) return <Typography>No sessions found.</Typography>;
+  if(!sessions.length) return (
+    <Box sx={{ textAlign: "center", py: 6 }}>
+      <HistoryIcon sx={{ fontSize: 48, color: "text.disabled", mb: 1 }} />
+      <Typography variant="h6" color="text.secondary" gutterBottom>
+        No sessions yet
+      </Typography>
+      <Typography variant="body2" color="text.disabled">
+        Run a plan session to see your recorded timestamps here.
+      </Typography>
+    </Box>
+  );
 
   /* ---------- UI ---------- */
-  return(
-    <Box sx={{maxWidth:isMobile?"100%":900,mx:"auto",px:isMobile?1:2,pt:2,pb:6}}>
-      {/* ─── header ─── */}
-      <Stack direction={isMobile?"column":"row"} justifyContent="space-between"
-             spacing={isMobile?1:0} mb={1}>
-        <Typography variant="h6">Your Sessions</Typography>
+  const toggleAll = () => {
+    if (selected.size === sessions.length) setSelected(new Set());
+    else setSelected(new Set(sessions.map(s => s.id)));
+  };
 
-        <Stack direction="row" spacing={1} flexWrap="nowrap"
-               sx={{width:isMobile?"100%":"auto"}}>
-          <Button size="small" variant="contained" color="secondary"
-            startIcon={<MergeIcon/>} disabled={selected.size<2}
-            onClick={mergeSelected} fullWidth={isMobile}
-            sx={{whiteSpace:"nowrap",minWidth:0}}>
-            Merge
-          </Button>
-          <Button size="small" variant="contained" color="error"
-            startIcon={<DeleteForeverIcon/>} disabled={selected.size===0}
-            onClick={deleteSelected} fullWidth={isMobile}
-            sx={{whiteSpace:"nowrap",minWidth:0}}>
-            Delete
-          </Button>
+  return(
+    <Box sx={{maxWidth:isMobile?"100%":900,mx:"auto",px:isMobile?1:2,pt:1,pb:6}}>
+      {/* ─── header row ─── */}
+      <Stack direction="row" alignItems="center" justifyContent="space-between" mb={2}>
+        <Stack direction="row" alignItems="center" spacing={1}>
+          <Checkbox
+            size="small"
+            checked={selected.size === sessions.length && sessions.length > 0}
+            indeterminate={selected.size > 0 && selected.size < sessions.length}
+            onChange={toggleAll}
+            sx={{ p: 0.5 }}
+          />
+          <Typography variant="body2" color="text.secondary" fontWeight={500}>
+            {selected.size > 0 ? `${selected.size} of ${sessions.length}` : `${sessions.length} session${sessions.length !== 1 ? "s" : ""}`}
+          </Typography>
         </Stack>
       </Stack>
 
-      {/* ─── session list ─── */}
-      <Paper variant="outlined">
-        <List dense>
-          {sessions.map(s=>(
-            <React.Fragment key={s.id}>
-              <ListItem
-                secondaryAction={
-                  <Stack direction="row" spacing={0}>
-                    {/* inline "plan info" icon */}
-                    <Tooltip
-                      title={
-                        plans[s.planId] === null
-                          ? "Plan deleted"
-                          : `Plan: ${plans[s.planId]?.name || s.planName || "(unknown)"}`
-                      }
-                    >
-                      <IconButton size={isMobile ? "small" : "medium"}>
-                        <InfoOutlinedIcon sx={isMobile ? { fontSize: 18 } : undefined} />
-                      </IconButton>
-                    </Tooltip>
+      {/* ─── session cards ─── */}
+      <Stack spacing={1.5}>
+        {sessions.map(s => {
+          const isSelected = selected.has(s.id);
+          const stampCount = s.timestamps?.length || 0;
+          const planName = plans[s.planId]?.name || s.planName || "(unknown)";
+          const planDeleted = plans[s.planId] === null;
+          const startedOffline = s.startedOffline || (typeof s.id === "string" && s.id.startsWith("local:"));
 
-                    <Tooltip title="Rename">
-                      <IconButton
-                        size={isMobile ? "small" : "medium"}
-                        onClick={() => {
-                          setEditId(s.id);
-                          setEditText(s.sessionTitle || "");
-                        }}
-                      >
-                        <EditIcon sx={isMobile ? { fontSize: 18 } : undefined} />
-                      </IconButton>
-                    </Tooltip>
-
-                    <Tooltip title="View details">
-                      <IconButton
-                        size={isMobile ? "small" : "medium"}
-                        onClick={() => setDetail(s)}
-                      >
-                        <VisibilityIcon sx={isMobile ? { fontSize: 18 } : undefined} />
-                      </IconButton>
-                    </Tooltip>
-
-                    <Tooltip title="Export TXT">
-                      <IconButton
-                        size={isMobile ? "small" : "medium"}
-                        onClick={() => exportTxt(s)}
-                      >
-                        <DownloadIcon sx={isMobile ? { fontSize: 18 } : undefined} />
-                      </IconButton>
-                    </Tooltip>
-                  </Stack>
-                }
-              >
-                <ListItemIcon sx={{minWidth:32,pr:0}}>
-                  <Checkbox edge="start" size="small"
-                    checked={selected.has(s.id)}
-                    onChange={(_,ck)=>setSelected(p=>{
-                      const n=new Set(p); ck?n.add(s.id):n.delete(s.id); return n;})}
+          return (
+            <Paper
+              key={s.id}
+              variant="outlined"
+              sx={{
+                p: 0,
+                overflow: "hidden",
+                borderColor: isSelected ? "primary.main" : "divider",
+                borderWidth: isSelected ? 2 : 1,
+                borderLeftWidth: 4,
+                borderLeftColor: isSelected ? "primary.main" : "secondary.light",
+                transition: "all 0.15s ease",
+                "&:hover": { borderColor: "primary.light", boxShadow: "0 2px 8px rgba(79,70,229,0.08)" },
+              }}
+            >
+              <Stack direction="row" alignItems="stretch">
+                {/* checkbox area */}
+                <Box sx={{
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  px: 1, bgcolor: isSelected ? "primary.50" : "transparent",
+                }}>
+                  <Checkbox
+                    size="small"
+                    checked={isSelected}
+                    onChange={(_, ck) => setSelected(p => {
+                      const n = new Set(p); ck ? n.add(s.id) : n.delete(s.id); return n;
+                    })}
+                    sx={{ p: 0.5 }}
                   />
-                </ListItemIcon>
+                </Box>
 
-                <ListItemText
-                  primary={
-                    <Stack direction="row" spacing={0.75} alignItems="center" flexWrap="wrap">
-                      <Typography component="span" sx={{fontSize:15,fontWeight:600}}>
-                        {s.sessionTitle||s.planName}
+                {/* main content — clickable to view detail */}
+                <Box
+                  onClick={() => setDetail(s)}
+                  sx={{
+                    flex: 1, py: 1.5, px: 1.5, cursor: "pointer",
+                    minWidth: 0,
+                    "&:hover": { bgcolor: "action.hover" },
+                  }}
+                >
+                  {/* title row */}
+                  <Stack direction="row" spacing={0.75} alignItems="center" flexWrap="wrap">
+                    <Typography sx={{ fontSize: 15, fontWeight: 600, lineHeight: 1.3 }} noWrap>
+                      {s.sessionTitle || s.planName}
+                    </Typography>
+                    {startedOffline && (
+                      <Tooltip title="Started offline">
+                        <OfflineBoltIcon sx={{ fontSize: 15, color: "warning.main" }} />
+                      </Tooltip>
+                    )}
+                    {s.isMerged && (
+                      <Tooltip title="Merged session">
+                        <MergeIcon sx={{ fontSize: 15, color: "primary.main" }} />
+                      </Tooltip>
+                    )}
+                  </Stack>
+
+                  {/* meta row */}
+                  <Stack direction="row" spacing={1} alignItems="center" mt={0.5} flexWrap="wrap">
+                    <Typography variant="caption" color="text.secondary">
+                      {shortDate(s.startedAt)}
+                    </Typography>
+                    <Box sx={{
+                      display: "inline-flex", alignItems: "center",
+                      bgcolor: stampCount > 0 ? "primary.50" : "grey.100",
+                      color: stampCount > 0 ? "primary.main" : "text.disabled",
+                      borderRadius: 1, px: 0.75, py: 0.1,
+                      fontSize: 11, fontWeight: 600,
+                    }}>
+                      {stampCount} ZUPT{stampCount !== 1 ? "s" : ""}
+                    </Box>
+                    {planDeleted ? (
+                      <Typography variant="caption" color="error" fontWeight={600}>
+                        plan deleted
                       </Typography>
+                    ) : (
+                      <Typography variant="caption" color="text.disabled" noWrap sx={{ maxWidth: 140 }}>
+                        {planName}
+                      </Typography>
+                    )}
+                  </Stack>
+                </Box>
 
-                      {/* tiny icons (no text) */}
-                      {(s.startedOffline || (typeof s.id === "string" && s.id.startsWith("local:"))) && (
-                        <Tooltip title="Started offline">
-                          <OfflineBoltIcon sx={{ fontSize: 16, color: "warning.main" }} />
-                        </Tooltip>
-                      )}
-                      {s.isMerged && (
-                        <Tooltip title="Merged session">
-                          <MergeIcon sx={{ fontSize: 16, color: "primary.main" }} />
-                        </Tooltip>
-                      )}
+                {/* action buttons */}
+                <Stack direction="row" alignItems="center" spacing={0} sx={{ pr: 0.5 }}>
+                  <Tooltip title="Rename">
+                    <IconButton
+                      size="small"
+                      onClick={() => { setEditId(s.id); setEditText(s.sessionTitle || ""); }}
+                    >
+                      <EditIcon sx={{ fontSize: 18 }} />
+                    </IconButton>
+                  </Tooltip>
+                  <Tooltip title="Export TXT">
+                    <IconButton size="small" onClick={() => exportTxt(s)}>
+                      <DownloadIcon sx={{ fontSize: 18 }} />
+                    </IconButton>
+                  </Tooltip>
+                </Stack>
+              </Stack>
+            </Paper>
+          );
+        })}
+      </Stack>
 
-                      {/* orphan plan indicator */}
-                      {plans[s.planId]===null&&(
-                        <Tooltip title="Plan deleted">
-                          <Typography component="span" color="error" sx={{fontWeight:600,fontSize:11}}>
-                            (plan deleted)
-                          </Typography>
-                        </Tooltip>
-                      )}
-                    </Stack>
-                  }
-                  secondary={`${shortDate(s.startedAt)} • ZUPTs: ${s.timestamps?.length||0}`}
-                  secondaryTypographyProps={{fontSize:10}}
-                />
-              </ListItem>
-              <Divider component="li"/>
-            </React.Fragment>
-          ))}
-        </List>
-      </Paper>
-
-      {/* ─── floating toolbar (copy / email) ─── */}
+      {/* ─── floating toolbar (selection actions) ─── */}
       {selected.size > 0 && (
         <Paper elevation={6} sx={{
-          position:"fixed",bottom:20,left:"50%",transform:"translateX(-50%)",
-          width:{xs:"calc(90% - 32px)",sm:"480px",md:"560px"},
-          px:1,py:1,borderRadius:4,zIndex:10,display:"flex",
-          backgroundColor: "rgba(255,255,255,0.15)",
-          border: "1px solid rgba(255,255,255,0.25)",
-          backdropFilter: "blur(5px)",
-          WebkitBackdropFilter: "blur(5px)",
+          position:"fixed",bottom:80,left:"50%",transform:"translateX(-50%)",
+          width:{xs:"calc(90% - 32px)",sm:"520px",md:"580px"},
+          px:2,py:1.25,borderRadius:4,zIndex:10,display:"flex",
+          bgcolor: "primary.main", color: "white",
           alignItems:"center", justifyContent: "center",gap:1,flexWrap:{xs:"wrap",sm:"nowrap"}
         }}>
+          <Typography sx={{fontWeight:600,fontSize:14,mr:0.5}}>{selected.size} selected</Typography>
 
-          <Typography sx={{fontWeight:500}}>{selected.size} selected</Typography>
-          <Button startIcon={<ContentCopyIcon/>}
+          <Button size="small" sx={{color:"white",minWidth:0}} startIcon={<ContentCopyIcon/>}
             onClick={async()=>{
               const txt=[...selected]
                 .map(id=>sessions.find(s=>s.id===id))
@@ -437,7 +484,7 @@ export default function SessionsPage() {
           >
             Copy
           </Button>
-          <Button startIcon={<EmailIcon/>}
+          <Button size="small" sx={{color:"white",minWidth:0}} startIcon={<EmailIcon/>}
             onClick={()=>{
               const body=encodeURIComponent(
                 [...selected].map(id=>sessions.find(s=>s.id===id))
@@ -447,144 +494,341 @@ export default function SessionsPage() {
           >
             E-mail
           </Button>
-          <IconButton onClick={()=>setSelected(new Set())}><CloseIcon/></IconButton>
+          <Button size="small" sx={{color:"white",minWidth:0}} startIcon={<MergeIcon/>}
+            disabled={selected.size<2}
+            onClick={mergeSelected}
+          >
+            Merge
+          </Button>
+          <Button size="small" sx={{color:"error.light",minWidth:0}} startIcon={<DeleteForeverIcon/>}
+            onClick={deleteSelected}
+          >
+            Delete
+          </Button>
+
+          <IconButton size="small" sx={{color:"white",ml:0.5}} onClick={()=>setSelected(new Set())}><CloseIcon fontSize="small"/></IconButton>
         </Paper>
       )}
 
-      {/* ─── full detail dialog (eye icon) ─── */}
-      <Dialog open={!!detail} onClose={()=>setDetail(null)}
-              maxWidth="md" fullWidth fullScreen={isMobile} scroll="body">
+      {/* ─── full detail dialog ─── */}
+      <Dialog open={!!detail} onClose={()=>{setDetail(null);setDisplayMode("table");}}
+              maxWidth="md" fullWidth fullScreen={isMobile} scroll="body"
+              PaperProps={{ sx: { borderRadius: isMobile ? 0 : 3, overflow: "hidden" } }}>
         {detail&&(()=>{            // IIFE
           const wn=utcToGps(toDateSafe(detail.startedAt)).wn;
           const rows=buildRows(detail);
           const startedOffline = detail.startedOffline || (typeof detail.id === "string" && detail.id.startsWith("local:"));
+          const detailPlanName = plans[detail.planId]?.name || detail.planName || "(unknown)";
+          const planDeleted = plans[detail.planId] === null;
+          const stampCount = detail.timestamps?.length || 0;
+          const startD = toDateSafe(detail.startedAt);
+          const endD = detail.endedAt ? toDateSafe(detail.endedAt) : null;
+          const durationSec = endD ? Math.round((endD - startD) / 1000) : null;
+          const durationStr = durationSec != null
+            ? durationSec >= 3600
+              ? `${Math.floor(durationSec/3600)}h ${Math.floor((durationSec%3600)/60)}m ${durationSec%60}s`
+              : durationSec >= 60
+                ? `${Math.floor(durationSec/60)}m ${durationSec%60}s`
+                : `${durationSec}s`
+            : null;
+
           return(
             <>
-              {/* title bar */}
-              {isMobile?(
-                <AppBar sx={{position:"relative"}} elevation={0} color="transparent">
-                  <Toolbar variant="dense">
-                    <IconButton edge="start" onClick={()=>setDetail(null)}>
-                      <CloseIcon/>
-                    </IconButton>
-                    <Typography sx={{ml:1,fontWeight:600}}>
-                      {detail.sessionTitle||detail.planName}
-                    </Typography>
-                  </Toolbar>
-                </AppBar>
-              ):(
-                <DialogTitle sx={{pr:6}}>
+              {/* ─── Header banner ─── */}
+              <Box sx={{
+                background: "linear-gradient(135deg, rgba(99,102,241,1) 0%, rgba(79,70,229,1) 55%, rgba(67,56,202,1) 100%)",
+                color: "#fff",
+                px: { xs: 2, sm: 3 },
+                pt: { xs: 2, sm: 2.5 },
+                pb: { xs: 2, sm: 2.5 },
+                position: "relative",
+              }}>
+                <IconButton
+                  onClick={()=>setDetail(null)}
+                  sx={{ position: "absolute", top: 8, right: 8, color: "rgba(255,255,255,0.8)", "&:hover": { color: "#fff", bgcolor: "rgba(255,255,255,0.12)" } }}
+                  size="small"
+                >
+                  <CloseIcon />
+                </IconButton>
+
+                <Typography variant={isMobile ? "h6" : "h5"} fontWeight={700} sx={{ pr: 4, textShadow: "0 1px 6px rgba(0,0,0,0.15)" }}>
                   {detail.sessionTitle||detail.planName}
-                  <IconButton onClick={()=>setDetail(null)}
-                              sx={{position:"absolute",right:8,top:8}}>
-                    <CloseIcon/>
-                  </IconButton>
-                </DialogTitle>
-              )}
-
-              <DialogContent dividers>
-                <Stack direction="row" spacing={1} alignItems="center">
-                  <Typography variant="body2">
-                    Started: {toDateSafe(detail.startedAt).toLocaleString()}
-                  </Typography>
-                  {startedOffline && (
-                    <Tooltip title="Started offline">
-                      <OfflineBoltIcon sx={{ fontSize: 16, color: "warning.main" }} />
-                    </Tooltip>
-                  )}
-                  <Tooltip
-                    title={
-                      plans[detail.planId] === null
-                        ? "Plan deleted"
-                        : `Plan: ${plans[detail.planId]?.name || detail.planName || "(unknown)"}`
-                    }
-                  >
-                    <InfoOutlinedIcon sx={{ fontSize: 16, color: "text.secondary" }} />
-                  </Tooltip>
-                </Stack>
-
-                <Typography variant="body2" gutterBottom>
-                  Ended: {detail.endedAt
-                    ? toDateSafe(detail.endedAt).toLocaleString()
-                    : "—"}
                 </Typography>
 
-                {plans[detail.planId]===null&&(
-                  <Typography variant="caption" color="error">
+                <Stack direction="row" spacing={1} mt={1} flexWrap="wrap" alignItems="center">
+                  <Box sx={{
+                    display: "inline-flex", alignItems: "center", gap: 0.5,
+                    bgcolor: "rgba(255,255,255,0.15)", borderRadius: 1.5, px: 1, py: 0.25,
+                    fontSize: 12, fontWeight: 600, backdropFilter: "blur(4px)",
+                  }}>
+                    <MapIcon sx={{ fontSize: 14 }} />
+                    {planDeleted ? "Plan deleted" : detailPlanName}
+                  </Box>
+                  <Box sx={{
+                    display: "inline-flex", alignItems: "center", gap: 0.5,
+                    bgcolor: "rgba(255,255,255,0.15)", borderRadius: 1.5, px: 1, py: 0.25,
+                    fontSize: 12, fontWeight: 600, backdropFilter: "blur(4px)",
+                  }}>
+                    {stampCount} ZUPT{stampCount !== 1 ? "s" : ""}
+                  </Box>
+                  {durationStr && (
+                    <Box sx={{
+                      display: "inline-flex", alignItems: "center", gap: 0.5,
+                      bgcolor: "rgba(255,255,255,0.15)", borderRadius: 1.5, px: 1, py: 0.25,
+                      fontSize: 12, fontWeight: 600, backdropFilter: "blur(4px)",
+                    }}>
+                      <AccessTimeIcon sx={{ fontSize: 14 }} />
+                      {durationStr}
+                    </Box>
+                  )}
+                  {startedOffline && (
+                    <Box sx={{
+                      display: "inline-flex", alignItems: "center", gap: 0.5,
+                      bgcolor: "rgba(255,214,102,0.9)", color: "#111", borderRadius: 1.5, px: 1, py: 0.25,
+                      fontSize: 12, fontWeight: 600,
+                    }}>
+                      <OfflineBoltIcon sx={{ fontSize: 14 }} />
+                      Offline
+                    </Box>
+                  )}
+                </Stack>
+              </Box>
+
+              <DialogContent sx={{ px: { xs: 2, sm: 3 }, py: 2 }}>
+                {/* ─── Time info strip ─── */}
+                <Stack
+                  direction={{ xs: "column", sm: "row" }}
+                  spacing={{ xs: 1, sm: 3 }}
+                  sx={{
+                    mb: 2.5, py: 1.5, px: 2,
+                    bgcolor: "action.hover", borderRadius: 2,
+                    border: "1px solid", borderColor: "divider",
+                  }}
+                >
+                  <Stack direction="row" spacing={1} alignItems="center" sx={{ flex: 1 }}>
+                    <CalendarTodayIcon sx={{ fontSize: 18, color: "primary.main" }} />
+                    <Box>
+                      <Typography variant="caption" color="text.secondary" fontWeight={600} sx={{ textTransform: "uppercase", letterSpacing: 0.5, lineHeight: 1 }}>
+                        Started
+                      </Typography>
+                      <Typography variant="body2" fontWeight={500}>
+                        {startD.toLocaleString(undefined, { month: "short", day: "numeric", year: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" })}
+                      </Typography>
+                    </Box>
+                  </Stack>
+
+                  <Stack direction="row" spacing={1} alignItems="center" sx={{ flex: 1 }}>
+                    <CalendarTodayIcon sx={{ fontSize: 18, color: endD ? "success.main" : "text.disabled" }} />
+                    <Box>
+                      <Typography variant="caption" color="text.secondary" fontWeight={600} sx={{ textTransform: "uppercase", letterSpacing: 0.5, lineHeight: 1 }}>
+                        Ended
+                      </Typography>
+                      <Typography variant="body2" fontWeight={500}>
+                        {endD
+                          ? endD.toLocaleString(undefined, { month: "short", day: "numeric", year: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" })
+                          : "In progress"}
+                      </Typography>
+                    </Box>
+                  </Stack>
+                </Stack>
+
+                {planDeleted && (
+                  <Alert severity="warning" variant="outlined" sx={{ mb: 2, borderRadius: 2 }}>
                     Original plan deleted — coordinates unavailable.
-                  </Typography>
+                  </Alert>
                 )}
 
-                <Divider sx={{my:2}}/>
+                {/* ─── Controls ─── */}
+                <Stack
+                  direction="row"
+                  spacing={1}
+                  alignItems="center"
+                  useFlexGap
+                  flexWrap="wrap"
+                  sx={{ mb: 2 }}
+                >
+                  <Select
+                    size="small"
+                    value={basis}
+                    onChange={e=>setBasis(e.target.value)}
+                    sx={{
+                      minWidth: 140, borderRadius: 2, fontSize: 13, fontWeight: 600,
+                      bgcolor: "action.hover",
+                      "& .MuiOutlinedInput-notchedOutline": { borderColor: "divider" },
+                      "&:hover .MuiOutlinedInput-notchedOutline": { borderColor: "primary.main" },
+                      "& .MuiSelect-select": { py: 0.75, pl: 1.5 },
+                    }}
+                    MenuProps={{
+                      PaperProps: {
+                        sx: { borderRadius: 2, mt: 0.5, boxShadow: 6 },
+                      },
+                    }}
+                  >
+                    <MenuItem value="UTC" sx={{ fontSize: 13, fontWeight: 500 }}>UTC (hhmmss)</MenuItem>
+                    <MenuItem value="GPS_SOW" sx={{ fontSize: 13, fontWeight: 500 }}>GPS SOW – wk {wn}</MenuItem>
+                  </Select>
 
-                {/* control bar */}
-                <Stack direction={isMobile?"column":"row"} spacing={2}
-                       flexWrap="wrap" mb={2}>
-                  <FormControl size="small"
-                    sx={{minWidth:180,width:isMobile?"100%":"auto"}}>
-                    <InputLabel>Time Basis</InputLabel>
-                    <Select value={basis} label="Time Basis"
-                            onChange={e=>setBasis(e.target.value)}>
-                      <MenuItem value="UTC">UTC (hhmmss)</MenuItem>
-                      <MenuItem value="GPS_SOW">GPS (SOW) – week {wn}</MenuItem>
-                    </Select>
-                  </FormControl>
-
-                  <ToggleButtonGroup size="small" exclusive value={view}
+                  <ToggleButtonGroup
+                    size="small"
+                    exclusive
+                    value={view}
                     onChange={(_,v)=>v&&setView(v)}
-                    sx={{width:isMobile?"100%":"auto"}}>
-                    <ToggleButton value="ZUPT" sx={{flex:1}}>ZUPT only</ToggleButton>
-                    <ToggleButton value="ALL"  sx={{flex:1}}>All stamps</ToggleButton>
+                    sx={{
+                      "& .MuiToggleButton-root": {
+                        px: 1.5, py: 0.5, fontSize: 12, fontWeight: 600,
+                        borderRadius: "8px !important", border: "none",
+                        color: "text.secondary",
+                        "&.Mui-selected": { bgcolor: "primary.main", color: "#fff", "&:hover": { bgcolor: "primary.dark" } },
+                      },
+                      bgcolor: "action.hover", borderRadius: 2, p: 0.25,
+                    }}
+                  >
+                    <ToggleButton value="ZUPT">ZUPT</ToggleButton>
+                    <ToggleButton value="ALL">All</ToggleButton>
                   </ToggleButtonGroup>
 
-                  <Box sx={{width:isMobile?"100%":200,px:2}}>
-                    <Typography variant="caption">Variant step (s)</Typography>
-                    <Slider value={step} min={0} max={20} step={1}
-                            valueLabelDisplay="auto"
-                            onChange={(_,v)=>setStep(v)}/>
-                  </Box>
+                  <ToggleButtonGroup
+                    size="small"
+                    exclusive
+                    value={displayMode}
+                    onChange={(_,v)=>v&&setDisplayMode(v)}
+                    sx={{
+                      "& .MuiToggleButton-root": {
+                        px: 1, py: 0.5, fontSize: 12, fontWeight: 600,
+                        borderRadius: "8px !important", border: "none",
+                        color: "text.secondary",
+                        "&.Mui-selected": { bgcolor: "primary.main", color: "#fff", "&:hover": { bgcolor: "primary.dark" } },
+                      },
+                      bgcolor: "action.hover", borderRadius: 2, p: 0.25,
+                    }}
+                  >
+                    <ToggleButton value="table"><TableChartIcon sx={{ fontSize: 16, mr: 0.5 }} />Table</ToggleButton>
+                    <ToggleButton value="map"><MapIcon sx={{ fontSize: 16, mr: 0.5 }} />Map</ToggleButton>
+                  </ToggleButtonGroup>
 
-                  <Button variant="outlined" fullWidth={isMobile}
-                          onClick={()=>exportTxt(detail)}>
-                    Export TXT
+                  <Stack
+                    direction="row"
+                    alignItems="center"
+                    spacing={1.5}
+                    sx={{
+                      bgcolor: "action.hover", borderRadius: 2, px: 1.5, py: 0.5,
+                    }}
+                  >
+                    <Typography variant="caption" color="text.secondary" fontWeight={600} noWrap sx={{ mr: 0.5 }}>
+                      Step (s)
+                    </Typography>
+                    <Slider
+                      value={step} min={0} max={20} step={1} size="small"
+                      valueLabelDisplay="auto"
+                      onChange={(_,v)=>setStep(v)}
+                      sx={{
+                        width: 80,
+                        "& .MuiSlider-track": {
+                          bgcolor: "primary.main",
+                        },
+                        "& .MuiSlider-rail": {
+                          bgcolor: "grey.400",
+                          opacity: 0.8,
+                        },
+                        "& .MuiSlider-thumb": {
+                          bgcolor: "primary.main",
+                          width: 14,
+                          height: 14,
+                          "&:hover, &.Mui-focusVisible": {
+                            boxShadow: (t) => `0 0 0 6px ${t.palette.primary.main}33`,
+                          },
+                        },
+                      }}
+                    />
+                    <Typography
+                      variant="caption" fontWeight={700}
+                      sx={{
+                        minWidth: 20, textAlign: "center",
+                        color: (t) => t.palette.mode === "dark" ? "grey.300" : "primary.main",
+                      }}
+                    >
+                      {step}
+                    </Typography>
+                  </Stack>
+
+                  <Box sx={{ flex: 1 }} />
+
+                  <Button
+                    variant="contained"
+                    size="small"
+                    startIcon={<DownloadIcon/>}
+                    onClick={()=>exportTxt(detail)}
+                    sx={{ borderRadius: 2, textTransform: "none", fontWeight: 600, px: 2 }}
+                  >
+                    Export
                   </Button>
                 </Stack>
 
-                {/* table */}
-                <TableContainer component={Paper} variant="outlined"
-                                sx={{maxHeight:340}}>
+                {/* ─── Data: table or map ─── */}
+                {displayMode === "map" ? (
+                  <Suspense fallback={<Box sx={{ height: 380, display: "flex", alignItems: "center", justifyContent: "center" }}><CircularProgress /></Box>}>
+                    <SessionMapView rows={rows} isDark={theme.palette.mode === "dark"} />
+                  </Suspense>
+                ) : (
+                <TableContainer
+                  component={Paper}
+                  variant="outlined"
+                  sx={{ maxHeight: 380, borderRadius: 2 }}
+                >
                   <Table size="small" stickyHeader>
                     <TableHead>
                       <TableRow>
-                        <TableCell>ZUPT / Stamp</TableCell>
-                        <TableCell>{basis==="UTC"
-                          ?"UTC hhmmss":`GPS SOW (wn ${wn})`}</TableCell>
-                        <TableCell>Lat</TableCell><TableCell>Lon</TableCell>
-                        <TableCell>H</TableCell>
+                        <TableCell sx={{ fontWeight: 700, bgcolor: "background.paper", borderBottom: "1px solid", borderColor: "divider", minWidth: 100 }}>
+                          ZUPT / Stamp
+                        </TableCell>
+                        <TableCell sx={{ fontWeight: 700, bgcolor: "background.paper", borderBottom: "1px solid", borderColor: "divider" }}>
+                          {basis==="UTC" ? "UTC hhmmss" : `GPS SOW (wn ${wn})`}
+                        </TableCell>
+                        <TableCell sx={{ fontWeight: 700, bgcolor: "background.paper", borderBottom: "1px solid", borderColor: "divider" }}>Lat</TableCell>
+                        <TableCell sx={{ fontWeight: 700, bgcolor: "background.paper", borderBottom: "1px solid", borderColor: "divider" }}>Lon</TableCell>
+                        <TableCell sx={{ fontWeight: 700, bgcolor: "background.paper", borderBottom: "1px solid", borderColor: "divider" }}>H</TableCell>
                         {["A1","A2","A3","B1","B2","B3"]
-                          .map(a=><TableCell key={a}>{a}</TableCell>)}
+                          .map(a => <TableCell key={a} sx={{ fontWeight: 700, bgcolor: "background.paper", borderBottom: "1px solid", borderColor: "divider", fontSize: 12 }}>{a}</TableCell>)}
                       </TableRow>
                     </TableHead>
                     <TableBody>
                       {rows.length
                         ? rows.map((r,i)=>(
-                            <TableRow key={i}
-                              sx={{"&:nth-of-type(even)":{
-                                backgroundColor:"action.hover"}}}>
-                              <TableCell>{r.name}</TableCell><TableCell>{r.time}</TableCell>
-                              <TableCell>{r.lat}</TableCell><TableCell>{r.lon}</TableCell>
-                              <TableCell>{r.h}</TableCell>
-                              {r.anchors.map((v,j)=><TableCell key={j}>{v}</TableCell>)}
+                            <TableRow
+                              key={i}
+                              sx={{
+                                "&:nth-of-type(even)": { backgroundColor: "action.hover" },
+                                "&:hover": { backgroundColor: (t) => t.palette.mode === "dark" ? "rgba(99,102,241,0.08)" : "rgba(99,102,241,0.04)" },
+                                ...(r.name.match(/^L\d+\s+(Start|Stop)$/) ? {
+                                  bgcolor: (t) => t.palette.mode === "dark" ? "rgba(99,102,241,0.12)" : "rgba(99,102,241,0.06)",
+                                } : {}),
+                              }}
+                            >
+                              <TableCell sx={{
+                                fontWeight: 600,
+                                color: r.name.match(/^L\d+\s+Start$/) ? "success.main"
+                                     : r.name.match(/^L\d+\s+Stop$/) ? "error.main"
+                                     : "primary.main",
+                                fontSize: 13,
+                              }}>
+                                {r.name}
+                              </TableCell>
+                              <TableCell sx={{ fontFamily: "monospace", fontSize: 13 }}>{r.time}</TableCell>
+                              <TableCell sx={{ fontFamily: "monospace", fontSize: 13 }}>{r.lat}</TableCell>
+                              <TableCell sx={{ fontFamily: "monospace", fontSize: 13 }}>{r.lon}</TableCell>
+                              <TableCell sx={{ fontFamily: "monospace", fontSize: 13 }}>{r.h}</TableCell>
+                              {r.anchors.map((v,j) => <TableCell key={j} sx={{ fontFamily: "monospace", fontSize: 12 }}>{v}</TableCell>)}
                             </TableRow>
                           ))
                         : <TableRow>
-                            <TableCell colSpan={10} align="center">
-                              — No matching stamps —
+                            <TableCell colSpan={11} align="center" sx={{ py: 4, color: "text.secondary" }}>
+                              No matching stamps
                             </TableCell>
                           </TableRow>}
                     </TableBody>
                   </Table>
                 </TableContainer>
+                )}
               </DialogContent>
             </>
           );})()}

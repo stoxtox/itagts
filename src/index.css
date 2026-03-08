@@ -1,11 +1,5 @@
-/* index.css */
+/* index.css — body styles handled by MUI CssBaseline */
 body {
   margin: 0;
   font-family: "Roboto", "Helvetica", "Arial", sans-serif;
-  background-color: #f3f4f6;
-}
-
-body {
-  margin: 0;
-  background-color: white;
 }
