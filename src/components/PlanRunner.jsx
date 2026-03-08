@@ -949,12 +949,13 @@ export default function PlanRunner({ onSessionActive }) {
         </DialogActions>
       </Dialog>
 
-      {/* Snackbar */}
+      {/* Snackbar — positioned above the docked action bar */}
       <Snackbar
         open={!!snack}
         autoHideDuration={2400}
         onClose={() => setSnack("")}
         anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+        sx={{ bottom: { xs: 80, sm: 90 } }}
       >
         <Alert severity="success" variant="filled" sx={{ width: "100%" }}>
           {snack}

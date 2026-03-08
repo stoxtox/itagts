@@ -56,6 +56,14 @@ const anchorLabels = {
   B2: "B2  (Lever Y, m)",
   B3: "B3  (Lever Z, m)"
 };
+const anchorLabelsShort = {
+  A1: "A1 (Lat)",
+  A2: "A2 (Lon)",
+  A3: "A3 (Ht)",
+  B1: "B1 (X, m)",
+  B2: "B2 (Y, m)",
+  B3: "B3 (Z, m)"
+};
 
 export default function PlanBuilder() {
   const theme    = useTheme();
@@ -318,23 +326,23 @@ export default function PlanBuilder() {
       />
 
       {/* ─── Step 2: Anchor Points ─── */}
-      <Stack direction="row" spacing={1} alignItems="center" mb={1.5}>
+      <Stack direction="row" spacing={1} alignItems="center" mb={1.5} flexWrap="wrap">
         <Box sx={{
           width: 24, height: 24, borderRadius: "50%",
           bgcolor: "primary.main", color: "white",
           display: "flex", alignItems: "center", justifyContent: "center",
-          fontSize: 13, fontWeight: 700,
+          fontSize: 13, fontWeight: 700, flexShrink: 0,
         }}>2</Box>
-        <Typography variant="subtitle1" fontWeight={600}>Anchor points</Typography>
-        <Typography variant="caption" color="text.secondary">(A = SDs, B = Lever Arm [m])</Typography>
+        <Typography variant="subtitle1" fontWeight={600} sx={{ whiteSpace: "nowrap" }}>Anchor points</Typography>
+        <Typography variant="caption" color="text.secondary" sx={{ whiteSpace: "nowrap" }}>(A = SDs, B = Lever Arm [m])</Typography>
       </Stack>
 
-      <Stack direction="row" spacing={2} sx={{ mb: 1 }}>
+      <Box sx={{ display: "flex", flexWrap: "wrap", gap: isMobile ? 1 : 2, mb: 1 }}>
         {["A1", "A2", "A3"].map(renderAnchor)}
-      </Stack>
-      <Stack direction="row" spacing={2} sx={{ mb: 3 }}>
+      </Box>
+      <Box sx={{ display: "flex", flexWrap: "wrap", gap: isMobile ? 1 : 2, mb: 3 }}>
         {["B1", "B2", "B3"].map(renderAnchor)}
-      </Stack>
+      </Box>
 
       <Divider sx={{ mb: 2 }} />
 
@@ -348,11 +356,12 @@ export default function PlanBuilder() {
         }}>3</Box>
         <Typography variant="subtitle1" fontWeight={600}>Add ZUPTs</Typography>
         {zupts.length > 0 && (
-          <Box sx={{
-            bgcolor: "primary.50", color: "primary.main",
+          <Box sx={(t) => ({
+            bgcolor: t.palette.mode === "dark" ? "rgba(99,102,241,0.18)" : "primary.50",
+            color: t.palette.mode === "dark" ? "primary.light" : "primary.main",
             borderRadius: 1, px: 0.75, py: 0.1,
             fontSize: 11, fontWeight: 600,
-          }}>
+          })}>
             {zupts.length} added
           </Box>
         )}
@@ -430,7 +439,7 @@ export default function PlanBuilder() {
     return (
       <TextField
         key={k}
-        label={anchorLabels[k]}
+        label={isMobile ? anchorLabelsShort[k] : anchorLabels[k]}
         type="number"
         value={anchors[k]}
         error={!!errText}
@@ -439,7 +448,7 @@ export default function PlanBuilder() {
         onBlur={() => markAnchorTouched(k)}
         size="small"
         inputProps={{ step: "0.1" }}
-        sx={{ flex: 1, minWidth: 120 }}
+        sx={{ flex: 1, minWidth: isMobile ? 90 : 120 }}
       />
     );
   }
