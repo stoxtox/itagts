@@ -24,3 +24,7 @@ yarn-error.log*
 
 # local environment variables
 .env*
+
+# Cloud Functions
+functions/node_modules
+functions/.env

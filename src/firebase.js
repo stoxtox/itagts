@@ -10,6 +10,8 @@ import {
   persistentLocalCache,
   persistentSingleTabManager,
 } from "firebase/firestore";
+import { getFunctions } from "firebase/functions";
+import { getAnalytics, isSupported } from "firebase/analytics";
 
 const firebaseConfig = {
   apiKey:            process.env.REACT_APP_FIREBASE_API_KEY,
@@ -35,5 +37,13 @@ export const auth = initializeAuth(app, {
   persistence: browserLocalPersistence,
   popupRedirectResolver: browserPopupRedirectResolver,
 });
+
+// Cloud Functions
+export const functions = getFunctions(app);
+
+// Analytics (lazy — only in supported browser environments)
+export const analyticsPromise = isSupported().then((yes) =>
+  yes ? getAnalytics(app) : null
+);
 
 export { app };

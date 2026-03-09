@@ -1,7 +1,7 @@
 [
     {
       "origin": [
-        "https://itagts.web.app",
+        "https://itagts.com",
         "http://localhost:3000"
       ],
       "method": ["GET", "HEAD"],

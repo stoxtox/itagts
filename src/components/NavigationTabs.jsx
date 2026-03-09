@@ -15,7 +15,6 @@ import {
   CircularProgress,
   Snackbar,
   Alert,
-  Tooltip,
   BottomNavigation,
   BottomNavigationAction,
   Skeleton
@@ -28,6 +27,7 @@ import LogoutIcon        from "@mui/icons-material/Logout";
 import DarkModeIcon      from "@mui/icons-material/DarkMode";
 import LightModeIcon     from "@mui/icons-material/LightMode";
 import NewReleasesIcon   from "@mui/icons-material/NewReleases";
+import SettingsIcon      from "@mui/icons-material/Settings";
 
 import { useThemeMode } from "../contexts/ThemeContext";
 import WhatsNewDialog from "./WhatsNewDialog";
@@ -36,7 +36,6 @@ import {
   GoogleAuthProvider,
   signInWithPopup,
   signInWithEmailAndPassword,
-  createUserWithEmailAndPassword,
   signOut,
   onAuthStateChanged
 } from "firebase/auth";
@@ -56,6 +55,17 @@ const PlanBuilder  = lazy(() => import("./PlanBuilder"));
 const PlansPage    = lazy(() => import("./PlansPage"));
 const SessionsPage = lazy(() => import("./SessionsPage"));
 
+/* Lazy-loaded auth pages */
+const SignUpPage         = lazy(() => import("./SignUpPage"));
+const VerifyEmailPage    = lazy(() => import("./VerifyEmailPage"));
+const ForgotPasswordPage = lazy(() => import("./ForgotPasswordPage"));
+const ResetPasswordPage  = lazy(() => import("./ResetPasswordPage"));
+
+/* Lazy-loaded legal & settings pages */
+const PrivacyPolicyPage  = lazy(() => import("./PrivacyPolicyPage"));
+const TermsOfServicePage = lazy(() => import("./TermsOfServicePage"));
+const SettingsPage       = lazy(() => import("./SettingsPage"));
+
 /* ---------- helpers ---------- */
 const viewFromPath = (pathname = "/") => {
   const slug = pathname.split("/")[1] || "";
@@ -73,6 +83,13 @@ const VIEWS = {
 };
 
 const VIEW_KEYS = ["runner", "creator", "plans", "sessions"];
+
+/* Auth page loading fallback */
+const AuthFallback = () => (
+  <Backdrop open sx={{ color: "#fff", zIndex: (t) => t.zIndex.drawer + 1 }}>
+    <CircularProgress size={60} />
+  </Backdrop>
+);
 
 export default function NavigationTabs() {
   const navigate = useNavigate();
@@ -103,7 +120,7 @@ export default function NavigationTabs() {
     return snap.exists();
   };
 
-  // LOGIN
+  // GOOGLE LOGIN
   const login = async () => {
     try {
       setLoading(true);
@@ -126,48 +143,28 @@ export default function NavigationTabs() {
     }
   };
 
-  // EMAIL/PASSWORD LOGIN
+  // EMAIL/PASSWORD LOGIN — no auto-create, sign-in only
   const emailLogin = async (email, password) => {
     try {
       setLoading(true);
-      let res;
-      try {
-        res = await signInWithEmailAndPassword(auth, email, password);
-      } catch (signInErr) {
-        if (signInErr.code === "auth/user-not-found" || signInErr.code === "auth/invalid-credential") {
-          res = await createUserWithEmailAndPassword(auth, email, password);
-          const uid = res.user.uid;
-          const ref = doc(db, "users", uid);
-          await setDoc(ref, {
-            uid,
-            name: email.split("@")[0],
-            email,
-            createdAt: new Date().toISOString()
-          });
-          return;
-        }
-        throw signInErr;
-      }
-      const exists = await userDocExists(res.user.uid);
-      if (!exists) {
-        const uid = res.user.uid;
-        const ref = doc(db, "users", uid);
-        await setDoc(ref, {
-          uid,
-          name: email.split("@")[0],
-          email,
-          createdAt: new Date().toISOString()
-        });
-      }
+      await signInWithEmailAndPassword(auth, email, password);
     } catch (err) {
       console.error(err);
-      setAuthError(err.message || "Email login failed.");
+      if (
+        err.code === "auth/user-not-found" ||
+        err.code === "auth/invalid-credential" ||
+        err.code === "auth/wrong-password"
+      ) {
+        setAuthError("Invalid email or password.");
+      } else {
+        setAuthError(err.message || "Login failed.");
+      }
     } finally {
       setLoading(false);
     }
   };
 
-  // SIGN UP
+  // GOOGLE SIGN UP
   const signup = async () => {
     try {
       setLoading(true);
@@ -233,13 +230,18 @@ export default function NavigationTabs() {
   // hide bottom nav during active runner session
   const [sessionActive, setSessionActive] = useState(false);
 
-  // choose body
-  const body = {
-    runner:   <PlanRunner onSessionActive={setSessionActive} />,
-    creator:  <PlanBuilder />,
-    plans:    <PlansPage />,
-    sessions: <SessionsPage />
-  }[activeView];
+  // choose body — settings page renders inside the layout, legal pages render full-screen
+  const isSettingsPage = location.pathname === "/settings";
+  const isFullScreenPage = ["/privacy", "/terms"].includes(location.pathname);
+  const body = isSettingsPage
+    ? <SettingsPage />
+    : {
+        runner:   <PlanRunner onSessionActive={setSessionActive} />,
+        creator:  <PlanBuilder />,
+        plans:    <PlansPage />,
+        sessions: <SessionsPage />
+      }[activeView];
+  const isSpecialPage = isSettingsPage || isFullScreenPage;
 
   // RENDER — loading
   if (!authLoaded) {
@@ -254,20 +256,35 @@ export default function NavigationTabs() {
   if (!user) {
     return (
       <>
-        <Routes>
-          <Route
-            path="/login"
-            element={
-              <LoginPage
-                onLogin={login}
-                onSignup={signup}
-                onEmailLogin={emailLogin}
-                loading={loading}
-              />
-            }
-          />
-          <Route path="*" element={<Navigate to="/login" replace />} />
-        </Routes>
+        <Suspense fallback={<AuthFallback />}>
+          <Routes>
+            <Route
+              path="/login"
+              element={
+                <LoginPage
+                  onLogin={login}
+                  onEmailLogin={emailLogin}
+                  loading={loading}
+                />
+              }
+            />
+            <Route
+              path="/signup"
+              element={
+                <SignUpPage
+                  onGoogleSignup={signup}
+                  loading={loading}
+                />
+              }
+            />
+            <Route path="/verify-email" element={<VerifyEmailPage />} />
+            <Route path="/forgot-password" element={<ForgotPasswordPage />} />
+            <Route path="/reset-password" element={<ResetPasswordPage />} />
+            <Route path="/privacy" element={<PrivacyPolicyPage />} />
+            <Route path="/terms" element={<TermsOfServicePage />} />
+            <Route path="*" element={<Navigate to="/login" replace />} />
+          </Routes>
+        </Suspense>
         <Snackbar
           open={!!authError}
           autoHideDuration={6000}
@@ -286,94 +303,111 @@ export default function NavigationTabs() {
     );
   }
 
+  // RENDER — full-screen legal pages (no header/footer chrome)
+  if (isFullScreenPage) {
+    const FullScreenComponent = location.pathname === "/privacy"
+      ? PrivacyPolicyPage
+      : TermsOfServicePage;
+    return (
+      <Suspense fallback={<AuthFallback />}>
+        <FullScreenComponent />
+      </Suspense>
+    );
+  }
+
   // RENDER — logged in
   return (
     <Box sx={{ minHeight: "100vh", bgcolor: "background.default", pb: sessionActive ? 0 : "80px", transition: "padding-bottom 0.3s ease" }}>
-      {/* top header bar */}
-      <Paper
-        elevation={0}
-        sx={{
-          position: "sticky",
-          top: 0,
-          zIndex: 10,
-          bgcolor: "background.paper",
-          borderBottom: "1px solid",
-          borderColor: "divider",
-          px: 2.5,
-          py: 1.5,
-        }}
-      >
-        <Stack direction="row" justifyContent="space-between" alignItems="center"
-               sx={{ maxWidth: 860, mx: "auto" }}>
-          <Typography variant="h6" fontWeight={700} sx={{ color: "primary.main" }}>
-            Timestamp Portal
-          </Typography>
-
-          <IconButton onClick={openMenu} size="small" sx={{ p: 0.5 }}>
-            <Avatar
-              src={user.photoURL}
-              alt={user.displayName}
-              sx={{
-                width: 34, height: 34,
-                bgcolor: user.photoURL ? undefined : "primary.main",
-                fontSize: 14, fontWeight: 700,
-              }}
-            >
-              {!user.photoURL && (user.displayName || user.email || "U")
-                .split(/[\s@]/)
-                .filter(Boolean)
-                .slice(0, 2)
-                .map(w => w[0].toUpperCase())
-                .join("")}
-            </Avatar>
-          </IconButton>
-
-          <Menu
-            anchorEl={menuAnchor}
-            open={Boolean(menuAnchor)}
-            onClose={closeMenu}
-            transformOrigin={{ horizontal: "right", vertical: "top" }}
-            anchorOrigin={{ horizontal: "right", vertical: "bottom" }}
-          >
-            <MenuItem disabled>
-              <Typography variant="body2" color="text.secondary">
-                {user.email}
-              </Typography>
-            </MenuItem>
-            <Divider />
-            <MenuItem onClick={toggleMode}>
-              <ListItemIcon>
-                {mode === "dark" ? <LightModeIcon fontSize="small" /> : <DarkModeIcon fontSize="small" />}
-              </ListItemIcon>
-              {mode === "dark" ? "Light mode" : "Dark mode"}
-            </MenuItem>
-            <MenuItem onClick={() => { closeMenu(); setWhatsNewOpen(true); }}>
-              <ListItemIcon><NewReleasesIcon fontSize="small" /></ListItemIcon>
-              What's New
-            </MenuItem>
-            <Divider />
-            <MenuItem onClick={() => { closeMenu(); logout(); }}>
-              <ListItemIcon><LogoutIcon fontSize="small" /></ListItemIcon>
-              Logout
-            </MenuItem>
-          </Menu>
-          <WhatsNewDialog open={whatsNewOpen} onClose={() => setWhatsNewOpen(false)} />
-        </Stack>
-      </Paper>
-
-      {/* main content */}
+      {/* unified content card with integrated header */}
       <Box sx={{ maxWidth: 860, mx: "auto", px: 2, pt: 2.5 }}>
-        <Paper elevation={0} sx={{ p: { xs: 2, sm: 3 }, borderRadius: 3, border: "1px solid", borderColor: "divider" }}>
-          <Suspense fallback={
-            <Stack spacing={2} sx={{ py: 2 }}>
-              <Skeleton variant="rounded" height={80} />
-              <Skeleton variant="rounded" height={56} />
-              <Skeleton variant="rounded" height={56} />
-              <Skeleton variant="rounded" height={44} />
+        <Paper elevation={0} sx={{ borderRadius: 3, border: "1px solid", borderColor: "divider", overflow: "hidden" }}>
+          {/* integrated header */}
+          <Box
+            sx={{
+              position: "sticky",
+              top: 0,
+              zIndex: 10,
+              bgcolor: "background.paper",
+              borderBottom: "1px solid",
+              borderColor: "divider",
+              px: { xs: 2, sm: 3 },
+              py: 1.5,
+            }}
+          >
+            <Stack direction="row" justifyContent="space-between" alignItems="center">
+              <Typography variant="h6" fontWeight={700} sx={{ color: "primary.main" }}>
+                Timestamp Portal
+              </Typography>
+
+              <IconButton onClick={openMenu} size="small" sx={{ p: 0.5 }} aria-label="Open profile menu">
+                <Avatar
+                  src={user.photoURL}
+                  alt={user.displayName}
+                  sx={{
+                    width: 34, height: 34,
+                    bgcolor: user.photoURL ? undefined : "primary.main",
+                    fontSize: 14, fontWeight: 700,
+                  }}
+                >
+                  {!user.photoURL && (user.displayName || user.email || "U")
+                    .split(/[\s@]/)
+                    .filter(Boolean)
+                    .slice(0, 2)
+                    .map(w => w[0].toUpperCase())
+                    .join("")}
+                </Avatar>
+              </IconButton>
+
+              <Menu
+                anchorEl={menuAnchor}
+                open={Boolean(menuAnchor)}
+                onClose={closeMenu}
+                transformOrigin={{ horizontal: "right", vertical: "top" }}
+                anchorOrigin={{ horizontal: "right", vertical: "bottom" }}
+              >
+                <MenuItem disabled>
+                  <Typography variant="body2" color="text.secondary">
+                    {user.email}
+                  </Typography>
+                </MenuItem>
+                <Divider />
+                <MenuItem onClick={toggleMode}>
+                  <ListItemIcon>
+                    {mode === "dark" ? <LightModeIcon fontSize="small" /> : <DarkModeIcon fontSize="small" />}
+                  </ListItemIcon>
+                  {mode === "dark" ? "Light mode" : "Dark mode"}
+                </MenuItem>
+                <MenuItem onClick={() => { closeMenu(); setWhatsNewOpen(true); }}>
+                  <ListItemIcon><NewReleasesIcon fontSize="small" /></ListItemIcon>
+                  What's New
+                </MenuItem>
+                <MenuItem onClick={() => { closeMenu(); navigate("/settings"); }}>
+                  <ListItemIcon><SettingsIcon fontSize="small" /></ListItemIcon>
+                  Settings
+                </MenuItem>
+                <Divider />
+                <MenuItem onClick={() => { closeMenu(); logout(); }}>
+                  <ListItemIcon><LogoutIcon fontSize="small" /></ListItemIcon>
+                  Logout
+                </MenuItem>
+              </Menu>
+              <WhatsNewDialog open={whatsNewOpen} onClose={() => setWhatsNewOpen(false)} />
             </Stack>
-          }>
-            {body}
-          </Suspense>
+          </Box>
+
+          {/* main content */}
+          <Box sx={{ p: { xs: 2, sm: 3 } }}>
+            <Suspense fallback={
+              <Stack spacing={2} sx={{ py: 2 }}>
+                <Skeleton variant="rounded" height={80} />
+                <Skeleton variant="rounded" height={56} />
+                <Skeleton variant="rounded" height={56} />
+                <Skeleton variant="rounded" height={44} />
+              </Stack>
+            }>
+              {body}
+            </Suspense>
+          </Box>
         </Paper>
       </Box>
 
@@ -393,9 +427,10 @@ export default function NavigationTabs() {
         }}
       >
         <BottomNavigation
-          value={VIEW_KEYS.indexOf(activeView)}
+          value={isSpecialPage ? -1 : VIEW_KEYS.indexOf(activeView)}
           onChange={(_, newIdx) => jump(VIEW_KEYS[newIdx])}
           showLabels
+          aria-label="Main navigation"
           sx={{
             maxWidth: 860,
             mx: "auto",
